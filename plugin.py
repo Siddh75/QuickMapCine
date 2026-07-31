@@ -1,4 +1,7 @@
+import os.path
+
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
 
@@ -9,7 +12,8 @@ class QuickMapCinePlugin:
         self.dock = None
 
     def initGui(self):
-        self.action = QAction("QuickMapCine", self.iface.mainWindow())
+        icon = QIcon(os.path.join(os.path.dirname(__file__), "icon.png"))
+        self.action = QAction(icon, "QuickMapCine", self.iface.mainWindow())
         self.action.triggered.connect(self.toggle_dock)
         self.iface.addToolBarIcon(self.action)
         self.iface.addPluginToMenu("QuickMapCine", self.action)

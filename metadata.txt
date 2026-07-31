@@ -11,3 +11,4 @@ repository=https://github.com/siddh75/QuickMapCine
 homepage=https://github.com/siddh75/QuickMapCine
 category=Plugins
 experimental=True
+icon=icon.png
