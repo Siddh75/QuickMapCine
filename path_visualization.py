@@ -214,7 +214,11 @@ class PathVisualizer:
             try:
                 layer.trigger3DUpdate()
             except AttributeError:
-                pass
+                # Older QGIS without this method -- the 3D scene just won't
+                # refresh until something else triggers it (see the long
+                # comment above); not fatal, but log it rather than swallow
+                # silently so a genuinely-missing update doesn't go unnoticed.
+                _log("trigger3DUpdate() not available on this QGIS version", Qgis.Info)
 
     def remove_from_project(self):
         self._ensure_layers_alive()
@@ -392,7 +396,11 @@ class PathVisualizer:
             try:
                 layer.trigger3DUpdate()
             except AttributeError:
-                pass  # older QGIS without this method
+                # Older QGIS without this method -- the 3D scene just won't
+                # refresh until something else triggers it (see the long
+                # comment above); not fatal, but log it rather than swallow
+                # silently so a genuinely-missing update doesn't go unnoticed.
+                _log("trigger3DUpdate() not available on this QGIS version", Qgis.Info)  # older QGIS without this method
 
         # Defensive redundancy on top of triggerRepaint(False) above, not a
         # substitute for it -- see update()'s docstring for map_canvas_2d.

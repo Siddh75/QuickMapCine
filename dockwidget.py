@@ -1549,8 +1549,11 @@ class CameraPathDockWidget(QDockWidget):
         if self._focus_map is not None and not _canvas_is_dead(canvas3d):
             try:
                 return canvas3d.mapSettings().mapToWorldCoordinates(self._focus_map)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Canvas can go away between the _canvas_is_dead() check above
+                # and this call -- fall back to the spinboxes below rather than
+                # crash, but log it so a genuine bug doesn't go unnoticed.
+                _log(f"_current_focus: mapToWorldCoordinates failed, using spinbox values: {exc}")
         return QgsVector3D(self.focus_x.value(), self.focus_y.value(), self.focus_z.value())
 
     def _imported_centroid(self):

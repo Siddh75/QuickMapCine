@@ -261,8 +261,13 @@ class CameraPathAnimator:
         if self._focus_map is not None and not _canvas_is_dead(self.canvas3d):
             try:
                 return self.canvas3d.mapSettings().mapToWorldCoordinates(self._focus_map)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Canvas can be torn down between the _canvas_is_dead() check
+                # above and this call (e.g. the 3D view closing mid-frame) --
+                # fall back to the static focus below rather than crash the
+                # running animation, but log it so a genuine bug doesn't go
+                # unnoticed.
+                _log(f"_live_focus: mapToWorldCoordinates failed, using static focus: {exc}", Qgis.Warning)
         return self.focus
 
     @staticmethod
@@ -372,8 +377,11 @@ class CameraPathAnimator:
                 try:
                     position = self.canvas3d.mapSettings().mapToWorldCoordinates(pos_map)
                     center = self.canvas3d.mapSettings().mapToWorldCoordinates(center_map)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Same defensive fallback as _live_focus() above -- keep the
+                    # scene-local position/center already unpacked from kf
+                    # rather than crash, but log rather than swallow silently.
+                    _log(f"_frame_data: mapToWorldCoordinates failed, using scene-local keyframe: {exc}", Qgis.Warning)
             distance, pitch, yaw = kf["distance"], kf["pitch"], kf["yaw"]
         else:
             t = frame_idx / (self.frame_count - 1)
@@ -658,8 +666,15 @@ class CameraPathAnimator:
             return
 
         out_path = os.path.join(self.output_dir, "camera_path.mp4")
+        # ffmpeg_path is never raw user text: _find_ffmpeg() only returns an
+        # absolute path resolved via shutil.which() (searches PATH for an
+        # executable actually named "ffmpeg") or one of the hardcoded
+        # _FFMPEG_FALLBACK_PATHS, each checked with os.path.isfile() first.
+        # Every other argument is either a constant flag or built internally
+        # (str(self.fps), os.path.join(...)) -- nothing here is shell-
+        # interpreted (no shell=True) or constructed from untrusted input.
         try:
-            subprocess.run(
+            subprocess.run(  # nosec B603 -- see comment above
                 [
                     ffmpeg_path, "-y",
                     "-framerate", str(self.fps),

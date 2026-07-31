@@ -80,23 +80,32 @@ CURVES = {
 }
 
 
+def _check(condition, message):
+    """assert-alike that isn't actually `assert` -- assert statements are
+    stripped under `python -O`, which would silently disable this self-test
+    rather than fail loudly (also flagged by the QGIS plugin repo's Bandit
+    scan, B101, for the same reason)."""
+    if not condition:
+        raise AssertionError(message)
+
+
 def demo():
     for name, (fn, params) in CURVES.items():
         kwargs = {p[0]: p[1] for p in params}
         pts = [fn(t / 20, **kwargs) for t in range(21)]
         for p in pts:
-            assert len(p) == 3
-            assert all(math.isfinite(v) for v in p)
+            _check(len(p) == 3, f"{name}: point isn't a 3-tuple: {p}")
+            _check(all(math.isfinite(v) for v in p), f"{name}: non-finite value in {p}")
         if name == "Helix":
             # not closed: z ramps monotonically instead of repeating
-            assert pts[-1][2] > pts[0][2]
+            _check(pts[-1][2] > pts[0][2], f"{name}: z should ramp up, start={pts[0]} end={pts[-1]}")
         elif name == "Fly Through":
             # not closed: a straight line, start and end are opposite ends
-            assert pts[0][0] > 0 > pts[-1][0]
+            _check(pts[0][0] > 0 > pts[-1][0], f"{name}: expected opposite ends, start={pts[0]} end={pts[-1]}")
         else:
             # closed loop: start and end offsets should coincide
             start, end = pts[0], pts[-1]
-            assert all(abs(a - b) < 1e-6 for a, b in zip(start, end)), name
+            _check(all(abs(a - b) < 1e-6 for a, b in zip(start, end)), f"{name}: not closed, start={start} end={end}")
     print("curves ok")
 
 

@@ -31,7 +31,10 @@ def _new_ax():
     try:
         ax.set_box_aspect((1, 1, 1))
     except AttributeError:
-        pass  # older matplotlib without set_box_aspect
+        # Older matplotlib without set_box_aspect -- axes will be unevenly
+        # scaled but diagrams still generate; not fatal, but printed rather
+        # than swallowed silently.
+        print("note: matplotlib too old for set_box_aspect(); axes may look stretched")
     ax.set_axis_off()
     return fig, ax
 
