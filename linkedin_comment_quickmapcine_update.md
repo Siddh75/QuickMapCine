@@ -1,0 +1,1 @@
+Update: QuickMapCine is now under review on the QGIS Plugin Repository. Also added the ability to export a generated trajectory and reuse/re-import it later, so a path you've dialed in once can be replayed or edited without regenerating it from scratch. Will share here once it's approved and live.
