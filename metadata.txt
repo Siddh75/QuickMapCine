@@ -1,0 +1,12 @@
+[general]
+name=QuickMapCine
+qgisMinimumVersion=3.36
+description=Animate the 3D map view camera along parametric paths (helix, lissajous, torus knot, trefoil knot) and export the result as video.
+version=0.1
+author=Siddharth Gupta
+email=siddharthgupta7may@gmail.com
+about=Drives the QGIS 3D Map View camera along a parametric path and exports frames + a stitched video via ffmpeg. Works with whatever is loaded in the 3D scene (point clouds, meshes, DEM terrain, extruded vectors) since it only moves the camera.
+tracker=
+repository=
+category=Plugins
+experimental=True
