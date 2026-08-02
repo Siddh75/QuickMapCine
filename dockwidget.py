@@ -918,13 +918,6 @@ class CameraPathDockWidget(QDockWidget):
         mapping, coord_space = trajectory_io.suggest_csv_mapping(headers)
         self._populate_csv_mapping(headers, mapping, coord_space)
         self.csv_mapping_section.setVisible(True)
-        self.import_status.setText(
-            'Columns matched below -- check them (especially "Coordinates are in"). '
-            '"Orientation type" is guessed from which columns were found, but '
-            "confirm it -- only one source is used, and if it's Pitch/Yaw, "
-            'double-check the convention too. Then click "Load CSV with this '
-            'mapping".'
-        )
 
     def _on_csv_orientation_source_changed(self):
         """Shows only the field rows relevant to the selected orientation
