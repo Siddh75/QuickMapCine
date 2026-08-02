@@ -923,7 +923,7 @@ class CameraPathDockWidget(QDockWidget):
         show_lookat = source == "lookat"
         for field in trajectory_io.CSV_LOOKAT_FIELDS:
             self._set_csv_row_visible(self.csv_column_combos[field], show_lookat)
-        for field in trajectory_io.CSV_ORIENTATION_FIELDS + ["roll"]:
+        for field in trajectory_io.CSV_ORIENTATION_FIELDS + trajectory_io.CSV_ORIENTATION_OPTIONAL_FIELDS:
             self._set_csv_row_visible(self.csv_column_combos[field], not show_lookat)
         self._set_csv_row_visible(self.csv_angle_convention_combo, not show_lookat)
 

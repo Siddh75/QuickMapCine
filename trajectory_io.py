@@ -66,12 +66,27 @@ class TrajectoryLoadError(Exception):
 CSV_POSITION_FIELDS = ["x", "y", "z"]
 CSV_LOOKAT_FIELDS = ["look_x", "look_y", "look_z"]
 CSV_ORIENTATION_FIELDS = ["pitch", "yaw"]
+# roll is kept separate from CSV_ORIENTATION_FIELDS (never required, never
+# part of the either/or check below) but grouped with it everywhere else --
+# ordering here, and the show/hide toggle in dockwidget.py's
+# _on_csv_orientation_source_changed() -- since it's only ever meaningful
+# alongside pitch/yaw, not alongside a look-at target or the generic
+# frame/time_s fields below.
+CSV_ORIENTATION_OPTIONAL_FIELDS = ["roll"]
 # CSV_REQUIRED_FIELDS kept for backwards compatibility (just position -- the
 # unconditionally-required subset). See load_csv_with_mapping() for the
 # either/or check between CSV_LOOKAT_FIELDS and CSV_ORIENTATION_FIELDS.
 CSV_REQUIRED_FIELDS = CSV_POSITION_FIELDS
-CSV_OPTIONAL_FIELDS = ["frame", "time_s", "roll"]
-CSV_ALL_FIELDS = CSV_POSITION_FIELDS + CSV_LOOKAT_FIELDS + CSV_ORIENTATION_FIELDS + CSV_OPTIONAL_FIELDS
+# Generic, orientation-independent optional fields -- deliberately ordered
+# after all orientation-related fields (look-at, pitch/yaw, roll) rather than
+# interleaved with them, so the mapping form groups "how the camera is
+# oriented" together and "which row is which frame/timestamp" as a clearly
+# separate, later group.
+CSV_OPTIONAL_FIELDS = ["frame", "time_s"]
+CSV_ALL_FIELDS = (
+    CSV_POSITION_FIELDS + CSV_LOOKAT_FIELDS + CSV_ORIENTATION_FIELDS
+    + CSV_ORIENTATION_OPTIONAL_FIELDS + CSV_OPTIONAL_FIELDS
+)
 
 FIELD_LABELS = {
     "x": "Position X", "y": "Position Y", "z": "Position Z",
@@ -218,11 +233,12 @@ def load_csv_with_mapping(
       - "lookat": requires all of CSV_LOOKAT_FIELDS (look_x/y/z) mapped.
         CSV_ORIENTATION_FIELDS are ignored even if mapped.
       - "angles": requires all of CSV_ORIENTATION_FIELDS (pitch/yaw) mapped.
-        CSV_LOOKAT_FIELDS are ignored even if mapped. roll may optionally
-        also be mapped; it's read only to raise a warning that it was
-        ignored, since QGIS's look-at camera has no roll degree of freedom
-        to apply it to.
-    CSV_OPTIONAL_FIELDS may be left unmapped (None).
+        CSV_LOOKAT_FIELDS are ignored even if mapped. CSV_ORIENTATION_OPTIONAL_FIELDS
+        (roll) may optionally also be mapped; it's read only to raise a
+        warning that it was ignored, since QGIS's look-at camera has no roll
+        degree of freedom to apply it to.
+    CSV_ORIENTATION_OPTIONAL_FIELDS and CSV_OPTIONAL_FIELDS may always be
+    left unmapped (None).
 
     coord_space: "map" (mapping's x/y/z/look_* columns are project-CRS,
     converted via mapToWorldCoordinates) or "scene" (already this project's
