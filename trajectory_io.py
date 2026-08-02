@@ -21,22 +21,37 @@ Two file types, handled differently:
        guess at whether the coordinates are project-CRS or this project's
        3D-scene-local space), meant to pre-fill an editable form, never to be
        trusted blindly.
-    3. load_csv_with_mapping(path, mapping, coord_space, ...) -- the mapping
-       the user confirmed (or corrected) in that form, applied to every row.
-  Required fields: x, y, z (camera position), look_x, look_y, look_z (look-at
-  target). A look-at target is required rather than a raw rotation (pitch/yaw/
-  roll) because rotation conventions differ enough between tools (axis order,
-  degrees vs radians, handedness) that guessing wrong would point the camera
-  off with no obvious symptom -- a look-at point is unambiguous regardless of
-  source tool. Optional: frame, time_s (row order + an assumed fps is used if
-  neither is mapped).
+    3. load_csv_with_mapping(path, mapping, coord_space, ..., angle_convention)
+       -- the mapping the user confirmed (or corrected) in that form, applied
+       to every row.
+  Required fields: x, y, z (camera position, always). Orientation is then
+  given ONE of two ways, whichever the mapping has fully filled in:
+    - look_x, look_y, look_z: a look-at target. Preferred and unambiguous
+      regardless of source tool -- this is why the plugin has always
+      supported this route, and why it wins if both are somehow mapped.
+    - pitch, yaw (optionally roll): camera orientation angles directly. This
+      exists because some tools only ever export orientation, never a
+      look-at point. The risk flagged here previously stands: rotation
+      conventions differ between tools (axis order, degrees vs radians,
+      handedness, where pitch=0 points), and guessing wrong points the
+      camera off with no obvious symptom. Rather than guess, the mapping
+      form makes the assumed convention an explicit, visible choice
+      (angle_convention: "qgis", matching this plugin's own pitch/yaw
+      exactly, or "aviation", a gimbal/drone-style convention where pitch=0
+      is level and -90 is straight down -- see load_csv_with_mapping()'s
+      docstring for the exact formula each implies). roll can never be
+      represented -- QGIS's look-at camera has no roll degree of freedom --
+      so a mapped roll column is only used to raise a warning that it was
+      read but ignored, never applied.
+  Optional: frame, time_s (row order + an assumed fps is used if neither is
+  mapped).
 """
 import csv
 import json
 
 from qgis.core import QgsVector3D
 
-from .animator import _offset_to_pose
+from .animator import _offset_to_pose, _pose_to_offset
 
 
 class TrajectoryLoadError(Exception):
@@ -45,13 +60,24 @@ class TrajectoryLoadError(Exception):
     readable, meant to be shown as-is in the dock widget's status label."""
 
 
-CSV_REQUIRED_FIELDS = ["x", "y", "z", "look_x", "look_y", "look_z"]
-CSV_OPTIONAL_FIELDS = ["frame", "time_s"]
-CSV_ALL_FIELDS = CSV_REQUIRED_FIELDS + CSV_OPTIONAL_FIELDS
+CSV_POSITION_FIELDS = ["x", "y", "z"]
+CSV_LOOKAT_FIELDS = ["look_x", "look_y", "look_z"]
+CSV_ORIENTATION_FIELDS = ["pitch", "yaw"]
+# CSV_REQUIRED_FIELDS kept for backwards compatibility (just position -- the
+# unconditionally-required subset). See load_csv_with_mapping() for the
+# either/or check between CSV_LOOKAT_FIELDS and CSV_ORIENTATION_FIELDS.
+CSV_REQUIRED_FIELDS = CSV_POSITION_FIELDS
+CSV_OPTIONAL_FIELDS = ["frame", "time_s", "roll"]
+CSV_ALL_FIELDS = CSV_POSITION_FIELDS + CSV_LOOKAT_FIELDS + CSV_ORIENTATION_FIELDS + CSV_OPTIONAL_FIELDS
 
 FIELD_LABELS = {
     "x": "Position X", "y": "Position Y", "z": "Position Z",
-    "look_x": "Look-at X", "look_y": "Look-at Y", "look_z": "Look-at Z",
+    "look_x": "Look-at X (or use Pitch/Yaw below)",
+    "look_y": "Look-at Y (or use Pitch/Yaw below)",
+    "look_z": "Look-at Z (or use Pitch/Yaw below)",
+    "pitch": "Pitch (alt. to look-at -- see convention below)",
+    "yaw": "Yaw / Heading (alt. to look-at -- see convention below)",
+    "roll": "Roll (optional -- cannot be represented, dropped with a warning)",
     "frame": "Frame (optional)", "time_s": "Time, seconds (optional)",
 }
 
@@ -65,9 +91,20 @@ _ALIASES = {
     "look_x": ["look_map_x", "look_x", "target_x", "lookat_x", "look_at_x"],
     "look_y": ["look_map_y", "look_y", "target_y", "lookat_y", "look_at_y"],
     "look_z": ["look_map_z", "look_z", "target_z", "lookat_z", "look_at_z"],
+    "pitch": ["pitch", "cam_pitch", "camera_pitch", "gimbal_pitch", "tilt"],
+    "yaw": ["yaw", "cam_yaw", "camera_yaw", "heading", "cam_heading", "gimbal_yaw", "bearing"],
+    "roll": ["roll", "cam_roll", "camera_roll", "gimbal_roll", "bank"],
     "frame": ["frame", "frame_idx", "frame_index", "index", "idx"],
     "time_s": ["time_s", "time", "timestamp", "t", "time_sec", "time_seconds"],
 }
+
+# angle_convention values accepted by load_csv_with_mapping() below. The
+# user-facing label -> value mapping (with the exact numeric meaning spelled
+# out) lives in dockwidget.py's _ANGLE_CONVENTIONS, next to the analogous
+# _COORD_SPACES -- kept there rather than here so this module only ever deals
+# in the plain value, same as it already does for coord_space ("map"/"scene").
+ANGLE_CONVENTION_VALUES = ("qgis", "aviation")
+DEFAULT_ANGLE_CONVENTION = "qgis"
 
 # Only this plugin's own scene-local column name (pos_x, written when no 3D
 # canvas was available at export time) implies "already scene-local" -- every
@@ -140,6 +177,11 @@ def suggest_csv_mapping(headers):
     """Best-guess field -> column name for each of CSV_ALL_FIELDS, plus a guess
     at coordinate space ("map" or "scene"). A starting point for an editable
     mapping form -- never applied without the user seeing and confirming it.
+
+    Does NOT guess angle_convention (see load_csv_with_mapping()) -- callers
+    should default their UI to DEFAULT_ANGLE_CONVENTION and require the user
+    to actually look at and confirm it, same reasoning as the module
+    docstring's note on why rotation conventions aren't auto-detected.
     """
     lookup = {h.strip().lower(): h for h in headers}
     mapping = {}
@@ -151,17 +193,54 @@ def suggest_csv_mapping(headers):
     return mapping, coord_space
 
 
-def load_csv_with_mapping(path, mapping, coord_space, map_settings, assumed_fps=30.0):
+def load_csv_with_mapping(
+    path, mapping, coord_space, map_settings, assumed_fps=30.0,
+    angle_convention=DEFAULT_ANGLE_CONVENTION,
+):
     """mapping: dict field -> column name (or None), covering CSV_ALL_FIELDS.
-    All of CSV_REQUIRED_FIELDS must be mapped; CSV_OPTIONAL_FIELDS may be None.
+    CSV_POSITION_FIELDS (x/y/z) must always be mapped. Orientation then needs
+    EITHER all of CSV_LOOKAT_FIELDS (look_x/y/z) OR all of
+    CSV_ORIENTATION_FIELDS (pitch/yaw) mapped -- look-at wins if somehow both
+    are (see module docstring). roll may optionally be mapped alongside
+    pitch/yaw; it's read only to raise a warning that it was ignored, since
+    QGIS's look-at camera has no roll degree of freedom to apply it to.
+    CSV_OPTIONAL_FIELDS may be left unmapped (None).
+
     coord_space: "map" (mapping's x/y/z/look_* columns are project-CRS,
     converted via mapToWorldCoordinates) or "scene" (already this project's
-    3D-scene-local space, used as-is).
+    3D-scene-local space, used as-is). Doesn't affect pitch/yaw/roll -- those
+    are angles, not coordinates, so coord_space has nothing to convert there.
+
+    angle_convention: only consulted when pitch/yaw are the orientation
+    source (ignored if look-at is mapped). One of ANGLE_CONVENTION_VALUES:
+      - "qgis": pitch/yaw are used exactly as QGIS's own convention defines
+        them (see animator.py's _offset_to_pose() docstring) -- 0deg pitch is
+        straight down, 90deg is level; no conversion applied.
+      - "aviation": a gimbal/drone-style convention where pitch is measured
+        from level (0deg=level, -90deg=straight down, +90deg=straight up) and
+        yaw is treated as equivalent to heading. Converted via
+        qgis_pitch = 90 + aviation_pitch (see _build_keyframe_from_orientation()).
+        This does not attempt true-north correction -- heading is passed
+        through as yaw unchanged, which only matches compass heading for
+        CRSs where +Y points north, same as every other X/Y-is-just-planar-
+        axes assumption already made elsewhere in this plugin.
     """
-    missing = [f for f in CSV_REQUIRED_FIELDS if not mapping.get(f)]
+    missing = [f for f in CSV_POSITION_FIELDS if not mapping.get(f)]
     if missing:
         labels = ", ".join(FIELD_LABELS[f] for f in missing)
         raise TrajectoryLoadError(f"no column mapped for: {labels}")
+
+    has_lookat = all(mapping.get(f) for f in CSV_LOOKAT_FIELDS)
+    has_orientation = all(mapping.get(f) for f in CSV_ORIENTATION_FIELDS)
+    if not has_lookat and not has_orientation:
+        lookat_labels = ", ".join(FIELD_LABELS[f] for f in CSV_LOOKAT_FIELDS)
+        orientation_labels = ", ".join(FIELD_LABELS[f] for f in CSV_ORIENTATION_FIELDS)
+        raise TrajectoryLoadError(
+            f"no orientation source mapped -- map either a look-at target "
+            f"({lookat_labels}) or orientation angles ({orientation_labels})"
+        )
+    if angle_convention not in ANGLE_CONVENTION_VALUES:
+        raise TrajectoryLoadError(f"unknown angle convention '{angle_convention}'")
     if coord_space not in ("map", "scene"):
         raise TrajectoryLoadError(f"unknown coordinate space '{coord_space}'")
     if coord_space == "map" and map_settings is None:
@@ -174,43 +253,95 @@ def load_csv_with_mapping(path, mapping, coord_space, map_settings, assumed_fps=
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
 
+    warnings = []
+    roll_col = mapping.get("roll") if has_orientation else None
+    roll_warned = False
     keyframes = []
     for i, row in enumerate(rows):
         try:
             raw_pos = QgsVector3D(
                 float(row[mapping["x"]]), float(row[mapping["y"]]), float(row[mapping["z"]])
             )
-            raw_look = QgsVector3D(
-                float(row[mapping["look_x"]]), float(row[mapping["look_y"]]), float(row[mapping["look_z"]])
-            )
             if coord_space == "map":
                 position = map_settings.mapToWorldCoordinates(raw_pos)
-                center = map_settings.mapToWorldCoordinates(raw_look)
-                position_map, center_map = raw_pos, raw_look
+                position_map = raw_pos
             else:
                 # Genuinely scene-local input (no map-CRS source at all) -- there's
                 # nothing to re-derive from later if the scene origin moves, so
                 # this keyframe stays static (see _SCENE_MISMATCH_WARNING's cousin
                 # in load_json_trajectory -- same inherent limitation here).
-                position, center = raw_pos, raw_look
-                position_map = center_map = None
+                position = raw_pos
+                position_map = None
 
             time_col = mapping.get("time_s")
             frame_col = mapping.get("frame")
             time_value = row.get(time_col) if time_col else None
             frame_value = row.get(frame_col) if frame_col else None
             frame_idx = i if frame_value in (None, "") else float(frame_value)
-            kf = _build_keyframe(
-                position, center, time_value, frame_idx, assumed_fps,
-                position_map=position_map, center_map=center_map,
-            )
+
+            if has_lookat:
+                raw_look = QgsVector3D(
+                    float(row[mapping["look_x"]]), float(row[mapping["look_y"]]), float(row[mapping["look_z"]])
+                )
+                if coord_space == "map":
+                    center = map_settings.mapToWorldCoordinates(raw_look)
+                    center_map = raw_look
+                else:
+                    center = raw_look
+                    center_map = None
+                kf = _build_keyframe(
+                    position, center, time_value, frame_idx, assumed_fps,
+                    position_map=position_map, center_map=center_map,
+                )
+            else:
+                pitch_raw = float(row[mapping["pitch"]])
+                yaw_deg = float(row[mapping["yaw"]])
+                pitch_deg = 90.0 + pitch_raw if angle_convention == "aviation" else pitch_raw
+                if roll_col and row.get(roll_col) not in (None, "") and not roll_warned:
+                    warnings.append(
+                        "roll column is mapped but ignored -- QGIS's look-at camera "
+                        "has no roll degree of freedom to apply it to"
+                    )
+                    roll_warned = True
+                kf = _build_keyframe_from_orientation(
+                    position, pitch_deg, yaw_deg, time_value, frame_idx, assumed_fps,
+                    position_map=position_map,
+                )
         except (KeyError, ValueError, TypeError) as exc:
             raise TrajectoryLoadError(f"row {i}: {exc}") from exc
         keyframes.append(kf)
 
     keyframes = _finalize(keyframes)
     fps = _estimate_fps(keyframes, None, assumed_fps)
-    return keyframes, fps, []
+    return keyframes, fps, warnings
+
+
+def _build_keyframe_from_orientation(
+    position, pitch_deg, yaw_deg, time_value, frame_idx, assumed_fps, position_map=None,
+):
+    """Builds a keyframe from position + orientation angles directly, instead
+    of an explicit look-at point -- used by load_csv_with_mapping() when the
+    mapping has pitch/yaw filled in instead of look_x/y/z.
+    setLookingAtPoint() only knows how to aim *at* a point, so a synthetic
+    "virtual" look-at target is placed 1 scene unit in front of the camera
+    along the given orientation, via animator.py's _pose_to_offset() -- the
+    same trick animator.py's _pose_for() uses for its "forward"/"sideways"
+    look modes. The distance used here is arbitrary (there's no real target to
+    measure one from) and affects only the synthetic center's position, never
+    the resulting camera pose: _build_keyframe() immediately re-derives
+    (distance, pitch, yaw) from (position - center), which by construction
+    reproduces pitch_deg/yaw_deg exactly regardless of what distance was used
+    to place the virtual center.
+    """
+    dx, dy, dz = _pose_to_offset(1.0, pitch_deg, yaw_deg)
+    center = QgsVector3D(position.x() - dx, position.y() - dy, position.z() - dz)
+    center_map = None
+    if position_map is not None:
+        center_map = QgsVector3D(position_map.x() - dx, position_map.y() - dy, position_map.z() - dz)
+    return _build_keyframe(
+        position, center, time_value, frame_idx, assumed_fps,
+        position_map=position_map, center_map=center_map,
+    )
 
 
 def _build_keyframe(position, center, time_value, frame_idx, assumed_fps, position_map=None, center_map=None):

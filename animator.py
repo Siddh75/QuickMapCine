@@ -101,6 +101,31 @@ def _offset_to_pose(dx, dy, dz):
     return distance, pitch, yaw
 
 
+def _pose_to_offset(distance, pitch_deg, yaw_deg):
+    """(distance, pitch, yaw) -> Cartesian offset from center. The exact
+    algebraic inverse of _offset_to_pose() -- implements the same verified
+    formula that function's docstring derives the atan2() calls from:
+        dx =  distance * sin(pitch) * sin(yaw)
+        dy = -distance * sin(pitch) * cos(yaw)
+        dz =  distance * cos(pitch)
+
+    Used by trajectory_io.py to synthesize a "virtual" look-at center when a
+    keyframe's orientation is given directly as pitch/yaw (e.g. an imported
+    CSV that has camera orientation angles instead of a look-at target)
+    rather than derived from an actual look-at point -- the same trick
+    _pose_for()'s "forward"/"sideways" look modes use for a curve-derived
+    facing direction below. round-trips exactly through _offset_to_pose():
+    _offset_to_pose(*_pose_to_offset(d, p, y)) == (d, p, y) for any valid
+    pitch in [0, 180] and yaw in (-180, 180].
+    """
+    pitch = math.radians(pitch_deg)
+    yaw = math.radians(yaw_deg)
+    dx = distance * math.sin(pitch) * math.sin(yaw)
+    dy = -distance * math.sin(pitch) * math.cos(yaw)
+    dz = distance * math.cos(pitch)
+    return dx, dy, dz
+
+
 class CameraPathAnimator:
     def __init__(
         self, canvas3d, curve_name, curve_kwargs, focus, duration_s, fps, output_dir=None,
