@@ -21,20 +21,23 @@ Two file types, handled differently:
        guess at whether the coordinates are project-CRS or this project's
        3D-scene-local space), meant to pre-fill an editable form, never to be
        trusted blindly.
-    3. load_csv_with_mapping(path, mapping, coord_space, ..., angle_convention)
-       -- the mapping the user confirmed (or corrected) in that form, applied
-       to every row.
-  Required fields: x, y, z (camera position, always). Orientation is then
-  given ONE of two ways, whichever the mapping has fully filled in:
-    - look_x, look_y, look_z: a look-at target. Preferred and unambiguous
-      regardless of source tool -- this is why the plugin has always
-      supported this route, and why it wins if both are somehow mapped.
-    - pitch, yaw (optionally roll): camera orientation angles directly. This
-      exists because some tools only ever export orientation, never a
-      look-at point. The risk flagged here previously stands: rotation
-      conventions differ between tools (axis order, degrees vs radians,
-      handedness, where pitch=0 points), and guessing wrong points the
-      camera off with no obvious symptom. Rather than guess, the mapping
+    3. load_csv_with_mapping(path, mapping, coord_space, ..., angle_convention,
+       orientation_source) -- the mapping the user confirmed (or corrected)
+       in that form, applied to every row.
+  Required fields: x, y, z (camera position, always). Orientation then comes
+  from EXACTLY ONE of two sources, chosen explicitly via orientation_source
+  (never inferred from which fields happen to be mapped -- picking the wrong
+  one silently is exactly the failure mode this plugin's mapping UI exists to
+  prevent):
+    - "lookat": look_x, look_y, look_z, a look-at target. Preferred and
+      unambiguous regardless of source tool -- this is why the plugin has
+      always supported this route, and remains the default.
+    - "angles": pitch, yaw (optionally roll), camera orientation angles
+      directly. This exists because some tools only ever export orientation,
+      never a look-at point. The risk flagged here previously stands:
+      rotation conventions differ between tools (axis order, degrees vs
+      radians, handedness, where pitch=0 points), and guessing wrong points
+      the camera off with no obvious symptom. Rather than guess, the mapping
       form makes the assumed convention an explicit, visible choice
       (angle_convention: "qgis", matching this plugin's own pitch/yaw
       exactly, or "aviation", a gimbal/drone-style convention where pitch=0
@@ -72,11 +75,8 @@ CSV_ALL_FIELDS = CSV_POSITION_FIELDS + CSV_LOOKAT_FIELDS + CSV_ORIENTATION_FIELD
 
 FIELD_LABELS = {
     "x": "Position X", "y": "Position Y", "z": "Position Z",
-    "look_x": "Look-at X (or use Pitch/Yaw below)",
-    "look_y": "Look-at Y (or use Pitch/Yaw below)",
-    "look_z": "Look-at Z (or use Pitch/Yaw below)",
-    "pitch": "Pitch (alt. to look-at -- see convention below)",
-    "yaw": "Yaw / Heading (alt. to look-at -- see convention below)",
+    "look_x": "Look-at X", "look_y": "Look-at Y", "look_z": "Look-at Z",
+    "pitch": "Pitch", "yaw": "Yaw / Heading",
     "roll": "Roll (optional -- cannot be represented, dropped with a warning)",
     "frame": "Frame (optional)", "time_s": "Time, seconds (optional)",
 }
@@ -105,6 +105,15 @@ _ALIASES = {
 # in the plain value, same as it already does for coord_space ("map"/"scene").
 ANGLE_CONVENTION_VALUES = ("qgis", "aviation")
 DEFAULT_ANGLE_CONVENTION = "qgis"
+
+# orientation_source values accepted by load_csv_with_mapping() below -- an
+# explicit choice between the two mutually-exclusive orientation inputs
+# (CSV_LOOKAT_FIELDS vs CSV_ORIENTATION_FIELDS), never inferred from which
+# fields happen to be mapped (see load_csv_with_mapping()'s docstring for
+# why). Label -> value mapping lives in dockwidget.py's
+# _ORIENTATION_SOURCES, same pattern as ANGLE_CONVENTION_VALUES above.
+ORIENTATION_SOURCE_VALUES = ("lookat", "angles")
+DEFAULT_ORIENTATION_SOURCE = "lookat"
 
 # Only this plugin's own scene-local column name (pos_x, written when no 3D
 # canvas was available at export time) implies "already scene-local" -- every
@@ -195,15 +204,24 @@ def suggest_csv_mapping(headers):
 
 def load_csv_with_mapping(
     path, mapping, coord_space, map_settings, assumed_fps=30.0,
-    angle_convention=DEFAULT_ANGLE_CONVENTION,
+    angle_convention=DEFAULT_ANGLE_CONVENTION, orientation_source=DEFAULT_ORIENTATION_SOURCE,
 ):
     """mapping: dict field -> column name (or None), covering CSV_ALL_FIELDS.
-    CSV_POSITION_FIELDS (x/y/z) must always be mapped. Orientation then needs
-    EITHER all of CSV_LOOKAT_FIELDS (look_x/y/z) OR all of
-    CSV_ORIENTATION_FIELDS (pitch/yaw) mapped -- look-at wins if somehow both
-    are (see module docstring). roll may optionally be mapped alongside
-    pitch/yaw; it's read only to raise a warning that it was ignored, since
-    QGIS's look-at camera has no roll degree of freedom to apply it to.
+    CSV_POSITION_FIELDS (x/y/z) must always be mapped.
+
+    orientation_source: an explicit, required choice of ORIENTATION_SOURCE_VALUES
+    -- NOT inferred from which fields happen to be mapped. This mirrors
+    coord_space and angle_convention below: rather than silently preferring
+    one source if a user maps both (or worse, mapping the wrong one without
+    noticing), the caller states which one this file actually uses, and only
+    that source's fields are read/required:
+      - "lookat": requires all of CSV_LOOKAT_FIELDS (look_x/y/z) mapped.
+        CSV_ORIENTATION_FIELDS are ignored even if mapped.
+      - "angles": requires all of CSV_ORIENTATION_FIELDS (pitch/yaw) mapped.
+        CSV_LOOKAT_FIELDS are ignored even if mapped. roll may optionally
+        also be mapped; it's read only to raise a warning that it was
+        ignored, since QGIS's look-at camera has no roll degree of freedom
+        to apply it to.
     CSV_OPTIONAL_FIELDS may be left unmapped (None).
 
     coord_space: "map" (mapping's x/y/z/look_* columns are project-CRS,
@@ -211,8 +229,8 @@ def load_csv_with_mapping(
     3D-scene-local space, used as-is). Doesn't affect pitch/yaw/roll -- those
     are angles, not coordinates, so coord_space has nothing to convert there.
 
-    angle_convention: only consulted when pitch/yaw are the orientation
-    source (ignored if look-at is mapped). One of ANGLE_CONVENTION_VALUES:
+    angle_convention: only consulted when orientation_source is "angles".
+    One of ANGLE_CONVENTION_VALUES:
       - "qgis": pitch/yaw are used exactly as QGIS's own convention defines
         them (see animator.py's _offset_to_pose() docstring) -- 0deg pitch is
         straight down, 90deg is level; no conversion applied.
@@ -230,15 +248,16 @@ def load_csv_with_mapping(
         labels = ", ".join(FIELD_LABELS[f] for f in missing)
         raise TrajectoryLoadError(f"no column mapped for: {labels}")
 
-    has_lookat = all(mapping.get(f) for f in CSV_LOOKAT_FIELDS)
-    has_orientation = all(mapping.get(f) for f in CSV_ORIENTATION_FIELDS)
-    if not has_lookat and not has_orientation:
-        lookat_labels = ", ".join(FIELD_LABELS[f] for f in CSV_LOOKAT_FIELDS)
-        orientation_labels = ", ".join(FIELD_LABELS[f] for f in CSV_ORIENTATION_FIELDS)
-        raise TrajectoryLoadError(
-            f"no orientation source mapped -- map either a look-at target "
-            f"({lookat_labels}) or orientation angles ({orientation_labels})"
-        )
+    if orientation_source not in ORIENTATION_SOURCE_VALUES:
+        raise TrajectoryLoadError(f"unknown orientation source '{orientation_source}'")
+    has_lookat = orientation_source == "lookat"
+    has_orientation = orientation_source == "angles"
+    required_fields = CSV_LOOKAT_FIELDS if has_lookat else CSV_ORIENTATION_FIELDS
+    missing_orientation = [f for f in required_fields if not mapping.get(f)]
+    if missing_orientation:
+        labels = ", ".join(FIELD_LABELS[f] for f in missing_orientation)
+        source_label = "look-at target" if has_lookat else "orientation angles"
+        raise TrajectoryLoadError(f"orientation source is set to {source_label}, but no column mapped for: {labels}")
     if angle_convention not in ANGLE_CONVENTION_VALUES:
         raise TrajectoryLoadError(f"unknown angle convention '{angle_convention}'")
     if coord_space not in ("map", "scene"):

@@ -149,6 +149,16 @@ _ANGLE_CONVENTIONS = {
     "QGIS (pitch: 0°=straight down, 90°=level)": "qgis",
     "Aviation / gimbal (pitch: 0°=level, -90°=straight down)": "aviation",
 }
+# Label shown in the mapping form's orientation-source combo -> trajectory_io's
+# orientation_source value. An explicit either/or choice, not a guess -- only
+# the fields for the selected source are shown/required (see
+# _on_csv_orientation_source_changed()); the other source's fields are hidden
+# entirely rather than left visible-but-ignorable, so there's no way to map
+# both by accident and wonder which one actually took effect.
+_ORIENTATION_SOURCES = {
+    "Look-at target (X/Y/Z)": "lookat",
+    "Orientation angles (Pitch/Yaw)": "angles",
+}
 _NO_COLUMN = "(none)"
 
 # Placeholder/first item in the Trajectory tab's "previously exported" combo --
@@ -418,18 +428,26 @@ class CameraPathDockWidget(QDockWidget):
         # CSV only -- shown after a .csv is picked, pre-filled by
         # trajectory_io.suggest_csv_mapping() and editable before committing.
         # JSON has a fixed schema (this plugin's own export) so it skips this
-        # entirely and loads directly in _load_json_file(). Orientation can be
-        # mapped either as a look-at target (Look-at X/Y/Z) or as camera
-        # angles (Pitch/Yaw) -- see trajectory_io.load_csv_with_mapping()'s
-        # docstring for why look-at wins if both are somehow mapped, and how
-        # the angle-convention combo below is used.
+        # entirely and loads directly in _load_json_file(). Orientation comes
+        # from EXACTLY ONE of a look-at target (Look-at X/Y/Z) or camera
+        # angles (Pitch/Yaw), chosen explicitly via the orientation-source
+        # combo below rather than inferred from whichever fields happen to be
+        # mapped -- see trajectory_io.load_csv_with_mapping()'s docstring.
         self.csv_mapping_section = QWidget()
         csv_form = QFormLayout(self.csv_mapping_section)
         csv_form.setContentsMargins(0, 0, 0, 0)
+        self.csv_mapping_form = csv_form  # kept for labelForField() -- see _set_csv_row_visible()
 
         self.csv_coord_space_combo = QComboBox()
         self.csv_coord_space_combo.addItems(list(_COORD_SPACES.keys()))
         csv_form.addRow("Coordinates are in", self.csv_coord_space_combo)
+
+        self.csv_orientation_source_combo = QComboBox()
+        self.csv_orientation_source_combo.addItems(list(_ORIENTATION_SOURCES.keys()))
+        self.csv_orientation_source_combo.currentIndexChanged.connect(
+            self._on_csv_orientation_source_changed
+        )
+        csv_form.addRow("Orientation comes from", self.csv_orientation_source_combo)
 
         self.csv_column_combos = {}
         for field in trajectory_io.CSV_ALL_FIELDS:
@@ -437,13 +455,12 @@ class CameraPathDockWidget(QDockWidget):
             self.csv_column_combos[field] = combo
             csv_form.addRow(trajectory_io.FIELD_LABELS[field], combo)
 
-        # Only matters if Pitch/Yaw end up mapped instead of a look-at target
-        # -- left visible regardless (rather than hidden/shown dynamically)
-        # since it's cheap to ignore and this avoids the state-tracking to
-        # show/hide it in step with the column combos above.
+        # Only relevant when orientation_source is "angles" -- shown/hidden in
+        # lockstep with the Pitch/Yaw/Roll rows by
+        # _on_csv_orientation_source_changed().
         self.csv_angle_convention_combo = QComboBox()
         self.csv_angle_convention_combo.addItems(list(_ANGLE_CONVENTIONS.keys()))
-        csv_form.addRow("If using Pitch/Yaw, convention is", self.csv_angle_convention_combo)
+        csv_form.addRow("Angle convention", self.csv_angle_convention_combo)
 
         self.csv_load_btn = QPushButton("Load CSV with this mapping")
         self.csv_load_btn.clicked.connect(self._load_csv_with_current_mapping)
@@ -451,6 +468,7 @@ class CameraPathDockWidget(QDockWidget):
 
         import_form.addRow(self.csv_mapping_section)
         self.csv_mapping_section.setVisible(False)
+        self._on_csv_orientation_source_changed()  # set initial row visibility
 
         self.import_status = QLabel(
             "Load a .json this plugin exported, or a .csv (its own export, or an "
@@ -889,11 +907,31 @@ class CameraPathDockWidget(QDockWidget):
         self.csv_mapping_section.setVisible(True)
         self.import_status.setText(
             'Columns matched below -- check them (especially "Coordinates are in"). '
-            "Orientation can come from either a look-at target (Look-at X/Y/Z) or "
-            "camera angles (Pitch/Yaw) -- map whichever this file actually has, and "
-            'if using Pitch/Yaw, double-check the convention. Then click "Load CSV '
-            'with this mapping".'
+            '"Orientation comes from" is guessed from which columns were found, but '
+            "confirm it -- only one source is used, and if it's Pitch/Yaw, "
+            'double-check the convention too. Then click "Load CSV with this '
+            'mapping".'
         )
+
+    def _on_csv_orientation_source_changed(self):
+        """Shows only the field rows relevant to the selected orientation
+        source (look-at target vs orientation angles), instead of leaving
+        both visible and letting trajectory_io.load_csv_with_mapping() ignore
+        whichever one wasn't chosen -- an ignored-but-still-filled-in row
+        invites confusion about which mapping actually took effect."""
+        source = _ORIENTATION_SOURCES[self.csv_orientation_source_combo.currentText()]
+        show_lookat = source == "lookat"
+        for field in trajectory_io.CSV_LOOKAT_FIELDS:
+            self._set_csv_row_visible(self.csv_column_combos[field], show_lookat)
+        for field in trajectory_io.CSV_ORIENTATION_FIELDS + ["roll"]:
+            self._set_csv_row_visible(self.csv_column_combos[field], not show_lookat)
+        self._set_csv_row_visible(self.csv_angle_convention_combo, not show_lookat)
+
+    def _set_csv_row_visible(self, field_widget, visible):
+        field_widget.setVisible(visible)
+        label = self.csv_mapping_form.labelForField(field_widget)
+        if label is not None:
+            label.setVisible(visible)
 
     def _populate_csv_mapping(self, headers, mapping, coord_space):
         options = [_NO_COLUMN] + headers
@@ -904,6 +942,24 @@ class CameraPathDockWidget(QDockWidget):
             guess = mapping.get(field)
             combo.setCurrentText(guess if guess else _NO_COLUMN)
             combo.blockSignals(False)
+
+        # Guess which orientation source this file actually has from which
+        # fields suggest_csv_mapping() matched -- still just a starting
+        # point for the combo above, not trusted blindly (same as every
+        # other guess in this form); "lookat" is the fallback when neither
+        # (or, ambiguously, both) got matched.
+        if all(mapping.get(f) for f in trajectory_io.CSV_ORIENTATION_FIELDS) and not all(
+            mapping.get(f) for f in trajectory_io.CSV_LOOKAT_FIELDS
+        ):
+            source_label = next(
+                label for label, value in _ORIENTATION_SOURCES.items() if value == "angles"
+            )
+        else:
+            source_label = next(
+                label for label, value in _ORIENTATION_SOURCES.items() if value == "lookat"
+            )
+        self.csv_orientation_source_combo.setCurrentText(source_label)
+        self._on_csv_orientation_source_changed()  # setCurrentText() above is a no-op if unchanged
 
         space_label = next(label for label, value in _COORD_SPACES.items() if value == coord_space)
         self.csv_coord_space_combo.setCurrentText(space_label)
@@ -946,6 +1002,7 @@ class CameraPathDockWidget(QDockWidget):
         }
         coord_space = _COORD_SPACES[self.csv_coord_space_combo.currentText()]
         angle_convention = _ANGLE_CONVENTIONS[self.csv_angle_convention_combo.currentText()]
+        orientation_source = _ORIENTATION_SOURCES[self.csv_orientation_source_combo.currentText()]
 
         # See _load_json_file()'s comment -- same reasoning, same fallback.
         # One side effect: load_csv_with_mapping()'s "map" coord_space used to
@@ -958,7 +1015,7 @@ class CameraPathDockWidget(QDockWidget):
         try:
             keyframes, fps, warnings = trajectory_io.load_csv_with_mapping(
                 path, mapping, coord_space, map_settings, assumed_fps=self.fps.value(),
-                angle_convention=angle_convention,
+                angle_convention=angle_convention, orientation_source=orientation_source,
             )
         except trajectory_io.TrajectoryLoadError as exc:
             self.import_status.setText(f"Failed to load: {exc}")
