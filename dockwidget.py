@@ -430,7 +430,7 @@ class CameraPathDockWidget(QDockWidget):
         # JSON has a fixed schema (this plugin's own export) so it skips this
         # entirely and loads directly in _load_json_file(). Orientation comes
         # from EXACTLY ONE of a look-at target (Look-at X/Y/Z) or camera
-        # angles (Pitch/Yaw), chosen explicitly via the orientation-source
+        # angles (Pitch/Yaw), chosen explicitly via the Orientation type
         # combo below rather than inferred from whichever fields happen to be
         # mapped -- see trajectory_io.load_csv_with_mapping()'s docstring.
         self.csv_mapping_section = QWidget()
@@ -442,25 +442,38 @@ class CameraPathDockWidget(QDockWidget):
         self.csv_coord_space_combo.addItems(list(_COORD_SPACES.keys()))
         csv_form.addRow("Coordinates are in", self.csv_coord_space_combo)
 
+        self.csv_column_combos = {}
+        for field in trajectory_io.CSV_POSITION_FIELDS:
+            combo = QComboBox()
+            self.csv_column_combos[field] = combo
+            csv_form.addRow(trajectory_io.FIELD_LABELS[field], combo)
+
+        # Orientation type + angle convention sit together, right above the
+        # orientation fields they control -- Orientation type picks which
+        # field group below is used (and shown), Angle convention only
+        # matters for the Pitch/Yaw group, so it's kept immediately under
+        # Orientation type rather than off at the end of the form.
         self.csv_orientation_source_combo = QComboBox()
         self.csv_orientation_source_combo.addItems(list(_ORIENTATION_SOURCES.keys()))
         self.csv_orientation_source_combo.currentIndexChanged.connect(
             self._on_csv_orientation_source_changed
         )
-        csv_form.addRow("Orientation comes from", self.csv_orientation_source_combo)
+        csv_form.addRow("Orientation type", self.csv_orientation_source_combo)
 
-        self.csv_column_combos = {}
-        for field in trajectory_io.CSV_ALL_FIELDS:
-            combo = QComboBox()
-            self.csv_column_combos[field] = combo
-            csv_form.addRow(trajectory_io.FIELD_LABELS[field], combo)
-
-        # Only relevant when orientation_source is "angles" -- shown/hidden in
+        # Only relevant when orientation type is "angles" -- shown/hidden in
         # lockstep with the Pitch/Yaw/Roll rows by
         # _on_csv_orientation_source_changed().
         self.csv_angle_convention_combo = QComboBox()
         self.csv_angle_convention_combo.addItems(list(_ANGLE_CONVENTIONS.keys()))
         csv_form.addRow("Angle convention", self.csv_angle_convention_combo)
+
+        for field in (
+            trajectory_io.CSV_LOOKAT_FIELDS + trajectory_io.CSV_ORIENTATION_FIELDS
+            + trajectory_io.CSV_ORIENTATION_OPTIONAL_FIELDS + trajectory_io.CSV_OPTIONAL_FIELDS
+        ):
+            combo = QComboBox()
+            self.csv_column_combos[field] = combo
+            csv_form.addRow(trajectory_io.FIELD_LABELS[field], combo)
 
         self.csv_load_btn = QPushButton("Load CSV with this mapping")
         self.csv_load_btn.clicked.connect(self._load_csv_with_current_mapping)
@@ -907,7 +920,7 @@ class CameraPathDockWidget(QDockWidget):
         self.csv_mapping_section.setVisible(True)
         self.import_status.setText(
             'Columns matched below -- check them (especially "Coordinates are in"). '
-            '"Orientation comes from" is guessed from which columns were found, but '
+            '"Orientation type" is guessed from which columns were found, but '
             "confirm it -- only one source is used, and if it's Pitch/Yaw, "
             'double-check the convention too. Then click "Load CSV with this '
             'mapping".'
