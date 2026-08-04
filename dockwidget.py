@@ -18,6 +18,8 @@ from qgis.core import (
     QgsPointCloudLayer,
     QgsPointXY,
     QgsProject,
+    QgsProjectElevationProperties,
+    QgsRasterDemTerrainProvider,
     QgsRasterLayer,
     QgsRectangle,
     QgsSettings,
@@ -1298,17 +1300,68 @@ class CameraPathDockWidget(QDockWidget):
             self.iface.closeMapCanvas3D("QuickMapCine")
             QgsProject.instance().viewsManager().remove3DView("QuickMapCine")
             self.canvas3d = self.iface.createNewMapCanvas3D("QuickMapCine")
+            map_settings = self.canvas3d.mapSettings()
+
+            # Explicitly mirror whatever's checked in the 2D layers panel into
+            # the 3D scene's own layer list, rather than trusting whatever
+            # createNewMapCanvas3D() defaults to -- cheap and always correct
+            # either way, and removes one more variable if a layer (a DEM
+            # raster in particular -- see below) doesn't show up as expected.
+            try:
+                map_settings.setLayers(self.iface.mapCanvas().layers())
+            except Exception as exc:
+                _log(f"could not set 3D scene layers: {exc}")
+
             # A freshly created 3D view defaults to terrain rendering ON (a flat
             # QgsFlatTerrainSettings, confirmed in QGIS's own source -- the "3D
             # Configuration > Terrain" checkbox shown checked is just this flag's
-            # UI). Not useful here (there's no DEM/elevation layer driving it, and
-            # it visually competes with the point cloud/camera path) -- default it
-            # off; the user can still turn it back on from that same dialog if
-            # they want it for a given project.
-            try:
-                self.canvas3d.mapSettings().setTerrainRenderingEnabled(False)
-            except Exception as exc:
-                _log(f"could not disable default terrain rendering: {exc}")
+            # UI). Before v0.2 there was never a DEM/elevation layer driving it,
+            # so it just visually competed with the point cloud/camera path for
+            # no benefit -- default it off in that case, same as before.
+            #
+            # v0.2 added DEM-enabled raster layers as an elevation source (see
+            # _is_elevation_layer()) -- when one is visible, configure the 3D
+            # view's terrain to actually use its real shape instead of leaving
+            # it flat, via the same provider/properties plumbing QGIS's own
+            # Project Properties > Elevation > Terrain dialog uses
+            # (QgsRasterDemTerrainProvider + Qgs3DMapSettings.configureTerrainFromProject()).
+            # QgsDemTerrainGenerator itself isn't exposed to Python at all, which
+            # is exactly the gap configureTerrainFromProject() bridges. A scratch
+            # QgsProjectElevationProperties is used purely as the parameter this
+            # method wants -- never assigned to QgsProject.instance() -- so this
+            # never mutates the user's actual project-level terrain settings,
+            # only this plugin's own private 3D view.
+            dem_layers = [
+                l for l in self.iface.mapCanvas().layers()
+                if isinstance(l, QgsRasterLayer) and _is_elevation_layer(l)
+            ]
+            if dem_layers:
+                # Only one raster can drive a DEM terrain generator -- first
+                # visible match wins (same "first hit wins" precedence
+                # _sample_dem_elevation() already uses).
+                try:
+                    info = self._point_cloud_extent()
+                    if info is None:
+                        raise RuntimeError("no combined extent available")
+                    full_extent = info[0]
+                    provider = QgsRasterDemTerrainProvider()
+                    provider.setLayer(dem_layers[0])
+                    scratch_properties = QgsProjectElevationProperties()
+                    scratch_properties.setTerrainProvider(provider)
+                    map_settings.configureTerrainFromProject(scratch_properties, full_extent)
+                    map_settings.setTerrainRenderingEnabled(True)
+                    _log(f"configured 3D terrain from DEM layer '{dem_layers[0].name()}'")
+                except Exception as exc:
+                    _log(f"could not configure DEM terrain, falling back to flat/off: {exc}")
+                    try:
+                        map_settings.setTerrainRenderingEnabled(False)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    map_settings.setTerrainRenderingEnabled(False)
+                except Exception as exc:
+                    _log(f"could not disable default terrain rendering: {exc}")
         return self.canvas3d
 
     def _pick_point_from_cloud(self, map_point_xy):
