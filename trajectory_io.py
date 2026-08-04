@@ -17,13 +17,20 @@ Two file types, handled differently:
   (X/Y/Z, tx/ty/tz, camera_x, ...). Column mapping is therefore a three-step,
   UI-visible process rather than a silent guess:
     1. csv_headers(path) -- just the header row.
-    2. suggest_csv_mapping(headers) -- best-guess field -> column name (and a
-       guess at whether the coordinates are project-CRS or this project's
-       3D-scene-local space), meant to pre-fill an editable form, never to be
-       trusted blindly.
-    3. load_csv_with_mapping(path, mapping, coord_space, ..., angle_convention,
+    2. suggest_csv_mapping(headers) -- best-guess field -> column name, meant
+       to pre-fill an editable form, never to be trusted blindly.
+    3. load_csv_with_mapping(path, mapping, map_settings, ..., angle_convention,
        orientation_source) -- the mapping the user confirmed (or corrected)
        in that form, applied to every row.
+  Position columns (x, y, z, and look_x/y/z if used) are always project-CRS
+  -- this plugin only ever works in one coordinate system in its UI (map/
+  project CRS, the same one the 2D map uses); there is no scene-local input
+  option to get wrong. (This plugin's own CSV export can, in one narrow edge
+  case -- no 3D view open at export time -- write a file with only
+  scene-local pos_x/y/z columns and no map_x/y/z; such a file has no
+  project-CRS data to import at all and isn't supported here as a
+  consequence, same as it was never supported to type scene-local numbers
+  into the Focus Point fields either.)
   Required fields: x, y, z (camera position, always). Orientation then comes
   from EXACTLY ONE of two sources, chosen explicitly via orientation_source
   (never inferred from which fields happen to be mapped -- picking the wrong
@@ -115,9 +122,8 @@ _ALIASES = {
 
 # angle_convention values accepted by load_csv_with_mapping() below. The
 # user-facing label -> value mapping (with the exact numeric meaning spelled
-# out) lives in dockwidget.py's _ANGLE_CONVENTIONS, next to the analogous
-# _COORD_SPACES -- kept there rather than here so this module only ever deals
-# in the plain value, same as it already does for coord_space ("map"/"scene").
+# out) lives in dockwidget.py's _ANGLE_CONVENTIONS -- kept there rather than
+# here so this module only ever deals in the plain value.
 ANGLE_CONVENTION_VALUES = ("qgis", "aviation")
 DEFAULT_ANGLE_CONVENTION = "qgis"
 
@@ -129,12 +135,6 @@ DEFAULT_ANGLE_CONVENTION = "qgis"
 # _ORIENTATION_SOURCES, same pattern as ANGLE_CONVENTION_VALUES above.
 ORIENTATION_SOURCE_VALUES = ("lookat", "angles")
 DEFAULT_ORIENTATION_SOURCE = "lookat"
-
-# Only this plugin's own scene-local column name (pos_x, written when no 3D
-# canvas was available at export time) implies "already scene-local" -- every
-# other match, including this plugin's own map_x, is assumed to be project-CRS,
-# since that's what every external tool would export.
-_SCENE_LOCAL_HINTS = {"pos_x", "pos_y", "pos_z"}
 
 
 def _load_json(path):
@@ -198,9 +198,9 @@ def csv_headers(path):
 
 
 def suggest_csv_mapping(headers):
-    """Best-guess field -> column name for each of CSV_ALL_FIELDS, plus a guess
-    at coordinate space ("map" or "scene"). A starting point for an editable
-    mapping form -- never applied without the user seeing and confirming it.
+    """Best-guess field -> column name for each of CSV_ALL_FIELDS. A starting
+    point for an editable mapping form -- never applied without the user
+    seeing and confirming it.
 
     Does NOT guess angle_convention (see load_csv_with_mapping()) -- callers
     should default their UI to DEFAULT_ANGLE_CONVENTION and require the user
@@ -211,25 +211,26 @@ def suggest_csv_mapping(headers):
     mapping = {}
     for field, aliases in _ALIASES.items():
         mapping[field] = next((lookup[alias] for alias in aliases if alias in lookup), None)
-
-    x_col = mapping.get("x")
-    coord_space = "scene" if x_col and x_col.strip().lower() in _SCENE_LOCAL_HINTS else "map"
-    return mapping, coord_space
+    return mapping
 
 
 def load_csv_with_mapping(
-    path, mapping, coord_space, map_settings, assumed_fps=30.0,
+    path, mapping, map_settings, assumed_fps=30.0,
     angle_convention=DEFAULT_ANGLE_CONVENTION, orientation_source=DEFAULT_ORIENTATION_SOURCE,
 ):
     """mapping: dict field -> column name (or None), covering CSV_ALL_FIELDS.
-    CSV_POSITION_FIELDS (x/y/z) must always be mapped.
+    CSV_POSITION_FIELDS (x/y/z) must always be mapped. Position columns
+    (x/y/z, look_x/y/z if used) are always project-CRS, converted via
+    map_settings.mapToWorldCoordinates() -- this plugin has only one
+    coordinate system anywhere in its UI (map/project CRS), so there's
+    nothing to choose here; map_settings must not be None.
 
     orientation_source: an explicit, required choice of ORIENTATION_SOURCE_VALUES
     -- NOT inferred from which fields happen to be mapped. This mirrors
-    coord_space and angle_convention below: rather than silently preferring
-    one source if a user maps both (or worse, mapping the wrong one without
-    noticing), the caller states which one this file actually uses, and only
-    that source's fields are read/required:
+    angle_convention below: rather than silently preferring one source if a
+    user maps both (or worse, mapping the wrong one without noticing), the
+    caller states which one this file actually uses, and only that source's
+    fields are read/required:
       - "lookat": requires all of CSV_LOOKAT_FIELDS (look_x/y/z) mapped.
         CSV_ORIENTATION_FIELDS are ignored even if mapped.
       - "angles": requires all of CSV_ORIENTATION_FIELDS (pitch/yaw) mapped.
@@ -239,11 +240,6 @@ def load_csv_with_mapping(
         degree of freedom to apply it to.
     CSV_ORIENTATION_OPTIONAL_FIELDS and CSV_OPTIONAL_FIELDS may always be
     left unmapped (None).
-
-    coord_space: "map" (mapping's x/y/z/look_* columns are project-CRS,
-    converted via mapToWorldCoordinates) or "scene" (already this project's
-    3D-scene-local space, used as-is). Doesn't affect pitch/yaw/roll -- those
-    are angles, not coordinates, so coord_space has nothing to convert there.
 
     angle_convention: only consulted when orientation_source is "angles".
     One of ANGLE_CONVENTION_VALUES:
@@ -276,13 +272,10 @@ def load_csv_with_mapping(
         raise TrajectoryLoadError(f"orientation source is set to {source_label}, but no column mapped for: {labels}")
     if angle_convention not in ANGLE_CONVENTION_VALUES:
         raise TrajectoryLoadError(f"unknown angle convention '{angle_convention}'")
-    if coord_space not in ("map", "scene"):
-        raise TrajectoryLoadError(f"unknown coordinate space '{coord_space}'")
-    if coord_space == "map" and map_settings is None:
+    if map_settings is None:
         raise TrajectoryLoadError(
-            "coordinates are set to project CRS but no 3D scene is open to convert "
-            "them -- open the 3D Map View first, or switch to Scene-local if these "
-            "coordinates are already in that space"
+            "no 3D scene available to convert the CSV's map/project CRS "
+            "coordinates -- open the 3D Map View first"
         )
 
     with open(path, newline="") as f:
@@ -297,16 +290,8 @@ def load_csv_with_mapping(
             raw_pos = QgsVector3D(
                 float(row[mapping["x"]]), float(row[mapping["y"]]), float(row[mapping["z"]])
             )
-            if coord_space == "map":
-                position = map_settings.mapToWorldCoordinates(raw_pos)
-                position_map = raw_pos
-            else:
-                # Genuinely scene-local input (no map-CRS source at all) -- there's
-                # nothing to re-derive from later if the scene origin moves, so
-                # this keyframe stays static (see _SCENE_MISMATCH_WARNING's cousin
-                # in load_json_trajectory -- same inherent limitation here).
-                position = raw_pos
-                position_map = None
+            position = map_settings.mapToWorldCoordinates(raw_pos)
+            position_map = raw_pos
 
             time_col = mapping.get("time_s")
             frame_col = mapping.get("frame")
@@ -318,12 +303,8 @@ def load_csv_with_mapping(
                 raw_look = QgsVector3D(
                     float(row[mapping["look_x"]]), float(row[mapping["look_y"]]), float(row[mapping["look_z"]])
                 )
-                if coord_space == "map":
-                    center = map_settings.mapToWorldCoordinates(raw_look)
-                    center_map = raw_look
-                else:
-                    center = raw_look
-                    center_map = None
+                center = map_settings.mapToWorldCoordinates(raw_look)
+                center_map = raw_look
                 kf = _build_keyframe(
                     position, center, time_value, frame_idx, assumed_fps,
                     position_map=position_map, center_map=center_map,

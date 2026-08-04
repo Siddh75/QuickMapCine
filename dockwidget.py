@@ -165,12 +165,6 @@ _LOOK_MODES = {
     "Sideways": "sideways",
 }
 
-# Label shown in the mapping form's coordinate-space combo -> trajectory_io's
-# coord_space value.
-_COORD_SPACES = {
-    "Map / project CRS": "map",
-    "Scene-local (this project's 3D view)": "scene",
-}
 # Label shown in the mapping form's angle-convention combo -> trajectory_io's
 # angle_convention value. Only consulted when Pitch/Yaw are mapped instead of
 # a look-at target -- see trajectory_io.load_csv_with_mapping()'s docstring.
@@ -300,20 +294,27 @@ class CameraPathDockWidget(QDockWidget):
         self.canvas3d = None
         self.param_boxes = {}  # kwarg name -> QDoubleSpinBox, rebuilt per curve
         self.param_roles = {}  # kwarg name -> "radius" / "height" / None, rebuilt per curve
-        # The authoritative focus point, in map/project CRS -- kept in sync with
-        # focus_x/y/z (scene-local, what the UI shows/edits) any time the user
-        # sets a new focus, by _refresh_focus_map()/_center_on_point_clouds()/
-        # _on_map_point_picked(). Needed because the 3D scene's origin can move
-        # after the user picks a focus (path_visualization.py's own extent-
-        # growing fix calls Qgs3DMapSettings.setExtent(), which unconditionally
-        # recenters origin -- confirmed in QGIS's source) -- if _build_animator()
-        # re-read focus_x/y/z directly at build time and reinterpreted those
-        # same numbers against whatever origin is *then* current, the resulting
-        # scene-local point would silently mean a different real-world location
-        # than the one the user actually picked. Re-deriving scene-local from
-        # this map-CRS point at build time, using the origin current *then*,
-        # keeps every animator pointed at the real spot regardless of how many
-        # times origin has shifted in between. See _build_animator().
+        # The authoritative focus point, in map/project CRS -- same coordinate
+        # space focus_x/y/z themselves display/accept (there's only ever one
+        # coordinate system in this plugin's UI now: map/project CRS, never
+        # scene-local -- see _current_focus()). Kept in sync with focus_x/y/z
+        # any time the user sets a new focus, by _center_on_point_clouds()/
+        # _on_map_point_picked()/_on_focus_spinbox_changed() (the last one is
+        # wired to every spinbox's valueChanged, so it's the catch-all that
+        # keeps this in sync with literally any edit, not just the two named
+        # actions). Kept as separate state from the spinboxes, rather than
+        # reading them directly, only because a real 3D scene's origin can
+        # move after the user picks a focus (path_visualization.py's own
+        # extent-growing fix calls Qgs3DMapSettings.setExtent(), which
+        # unconditionally recenters origin -- confirmed in QGIS's source):
+        # _current_focus() re-derives a fresh scene-local point from this
+        # map-CRS value, using whatever origin is current *right now*, every
+        # time _build_animator() needs one -- instead of ever caching a
+        # scene-local number that could go stale and silently point somewhere
+        # the user never picked. Re-deriving scene-local at build time, using
+        # the origin current *then*, keeps every animator pointed at the real
+        # spot regardless of how many times origin has shifted in between.
+        # See _build_animator().
         self._focus_map = None
         # Set by _load_json_file()/_load_csv_with_current_mapping(); read by
         # _build_animator() when the source combo is on "Import trajectory file".
@@ -462,10 +463,9 @@ class CameraPathDockWidget(QDockWidget):
         csv_form.setContentsMargins(0, 0, 0, 0)
         self.csv_mapping_form = csv_form  # kept for labelForField() -- see _set_csv_row_visible()
 
-        self.csv_coord_space_combo = QComboBox()
-        self.csv_coord_space_combo.addItems(list(_COORD_SPACES.keys()))
-        csv_form.addRow("Coordinates are in", self.csv_coord_space_combo)
-
+        # Position columns are always map/project CRS -- this plugin has only
+        # one coordinate system anywhere in its UI, so there's no
+        # "Coordinates are in" choice to make here (there used to be one).
         self.csv_column_combos = {}
         for field in trajectory_io.CSV_POSITION_FIELDS:
             combo = QComboBox()
@@ -605,7 +605,9 @@ class CameraPathDockWidget(QDockWidget):
         )
         pick_btn.clicked.connect(self._start_pick_on_map)
         focus_row.addWidget(pick_btn)
-        generate_form.addRow("Focus point (x, y, z)", focus_row)
+        for box in (self.focus_x, self.focus_y, self.focus_z):
+            box.setToolTip("Map/project CRS coordinates -- the same coordinate system the 2D map uses.")
+        generate_form.addRow("Focus point (map CRS x, y, z)", focus_row)
 
         # Rotation lives inside "Generate new" -- note this means it's hidden
         # whenever "Existing trajectories" is active instead, even though it
@@ -949,8 +951,8 @@ class CameraPathDockWidget(QDockWidget):
             self.import_status.setText("CSV has no header row")
             return
 
-        mapping, coord_space = trajectory_io.suggest_csv_mapping(headers)
-        self._populate_csv_mapping(headers, mapping, coord_space)
+        mapping = trajectory_io.suggest_csv_mapping(headers)
+        self._populate_csv_mapping(headers, mapping)
         self.csv_mapping_section.setVisible(True)
 
     def _on_csv_orientation_source_changed(self):
@@ -973,7 +975,7 @@ class CameraPathDockWidget(QDockWidget):
         if label is not None:
             label.setVisible(visible)
 
-    def _populate_csv_mapping(self, headers, mapping, coord_space):
+    def _populate_csv_mapping(self, headers, mapping):
         options = [_NO_COLUMN] + headers
         for field, combo in self.csv_column_combos.items():
             combo.blockSignals(True)
@@ -1000,9 +1002,6 @@ class CameraPathDockWidget(QDockWidget):
             )
         self.csv_orientation_source_combo.setCurrentText(source_label)
         self._on_csv_orientation_source_changed()  # setCurrentText() above is a no-op if unchanged
-
-        space_label = next(label for label, value in _COORD_SPACES.items() if value == coord_space)
-        self.csv_coord_space_combo.setCurrentText(space_label)
 
         # Always reset to the default rather than carry over from whatever
         # file was loaded previously -- suggest_csv_mapping() deliberately
@@ -1040,21 +1039,17 @@ class CameraPathDockWidget(QDockWidget):
             field: (combo.currentText() if combo.currentText() != _NO_COLUMN else None)
             for field, combo in self.csv_column_combos.items()
         }
-        coord_space = _COORD_SPACES[self.csv_coord_space_combo.currentText()]
         angle_convention = _ANGLE_CONVENTIONS[self.csv_angle_convention_combo.currentText()]
         orientation_source = _ORIENTATION_SOURCES[self.csv_orientation_source_combo.currentText()]
 
-        # See _load_json_file()'s comment -- same reasoning, same fallback.
-        # One side effect: load_csv_with_mapping()'s "map" coord_space used to
-        # require a live 3D view (map_settings was None otherwise, and it
-        # raises TrajectoryLoadError in that case) -- since this now always
-        # provides real or headless map_settings, that restriction no longer
-        # applies in practice; the guard in trajectory_io.py is harmless dead
-        # code, not removed since a future caller could still hit it.
+        # See _load_json_file()'s comment -- same reasoning, same fallback:
+        # provides a real map_settings if a 3D view is already open, otherwise
+        # a headless stand-in, so importing a CSV never forces a 3D view open
+        # on its own just to do this map-CRS -> scene-local conversion.
         map_settings = self._live_or_headless_canvas3d().mapSettings()
         try:
             keyframes, fps, warnings = trajectory_io.load_csv_with_mapping(
-                path, mapping, coord_space, map_settings, assumed_fps=self.fps.value(),
+                path, mapping, map_settings, assumed_fps=self.fps.value(),
                 angle_convention=angle_convention, orientation_source=orientation_source,
             )
         except trajectory_io.TrajectoryLoadError as exc:
@@ -1514,52 +1509,22 @@ class CameraPathDockWidget(QDockWidget):
         map_center = QgsVector3D(extent.center().x(), extent.center().y(), center_z)
         _log(f"combined extent={extent.toString()} -> map_center={map_center}")
 
-        project = QgsProject.instance()
-        if has_valid_crs:
-            # setLookingAtPoint() expects 3D-scene-local coordinates, not map/project
-            # coordinates -- the scene has its own origin and, when the project CRS is
-            # geographic, an internally-derived metric CRS too, both handled by
-            # mapSettings().mapToWorldCoordinates(). Deliberately not calling
-            # self._get_canvas3d() here (this used to force_refresh=True, always
-            # closing/reopening a real, visible 3D view just to compute this) --
-            # "Center on point clouds" shouldn't open or reopen a 3D view on its
-            # own (same reasoning as every other passive/focus action -- see
-            # _update_path_visualization()'s docstring). Uses whatever 3D view is
-            # already open if there is one, otherwise a headless, invisible
-            # stand-in purely for this conversion -- confirmed (see
-            # _HeadlessMapSettings3D's docstring) that the origin used here has no
-            # effect on _focus_map (the authoritative value, set below straight
-            # from map_center with no origin baked in at all) or anything
-            # _build_animator() re-derives from it later; it only affects these
-            # spinboxes' displayed numbers.
-            map_settings = self._live_or_headless_canvas3d().mapSettings()
-            _log(f"scene origin={map_settings.origin()} project_crs={project.crs().authid() or 'invalid/none'}")
-            scene_center = map_settings.mapToWorldCoordinates(map_center)
-        else:
-            # ponytail: no layer here has a CRS, so there's nothing valid for
-            # mapToWorldCoordinates()'s project<->scene conversion to apply to (QGIS
-            # renders such point clouds using their raw local coordinates directly,
-            # with no reprojection) -- use the combined center as scene position as-is.
-            # A mix of CRS-less and georeferenced point cloud layers isn't handled --
-            # there's no single coordinate space they both belong to.
-            scene_center = map_center
-        _log(f"map_center -> scene_center={scene_center}")
+        # focus_x/y/z always display/accept map/project CRS now -- see
+        # _focus_map's docstring in __init__ -- so map_center is exactly what
+        # goes in the spinboxes, no scene-local conversion needed here at all.
+        # Only exception: layers with no valid CRS (QGIS renders those using
+        # their own raw local coordinates, with no reprojection -- there's no
+        # map CRS to speak of), where map_center is really already scene-local
+        # by construction; _focus_map is left None in that case so
+        # _current_focus() reads the spinboxes directly rather than attempting
+        # a conversion that wouldn't mean anything for such a layer.
         for box in (self.focus_x, self.focus_y, self.focus_z):
             box.blockSignals(True)
-        self.focus_x.setValue(scene_center.x())
-        self.focus_y.setValue(scene_center.y())
-        self.focus_z.setValue(scene_center.z())
+        self.focus_x.setValue(map_center.x())
+        self.focus_y.setValue(map_center.y())
+        self.focus_z.setValue(map_center.z())
         for box in (self.focus_x, self.focus_y, self.focus_z):
             box.blockSignals(False)
-        # map_center is already the map-CRS point -- store it directly rather than
-        # round-tripping through the just-set scene-local spinboxes, and it's the
-        # authoritative value _build_animator() re-derives scene-local focus from
-        # from now on (see this attribute's docstring in __init__). Only when a
-        # real map<->scene conversion actually applies (has_valid_crs) -- in the
-        # CRS-less case scene_center is used completely unconverted (see comment
-        # above), so there's no map-CRS equivalent to track -- clear it (rather
-        # than leaving a stale value from some earlier, unrelated pick) so
-        # _build_animator() falls back to reading the spinboxes directly.
         self._focus_map = map_center if has_valid_crs else None
         self._update_path_visualization()
 
@@ -1670,12 +1635,8 @@ class CameraPathDockWidget(QDockWidget):
         effect of what's otherwise a purely 2D action. _focus_map (map-CRS,
         origin-independent -- see its docstring in __init__) is set directly
         from the pick, which is all _build_animator() actually needs; the
-        spinboxes below are converted for display via
-        _live_or_headless_canvas3d() (reuses a real 3D canvas if one's
-        already open, otherwise a headless stand-in that's exactly as correct
-        for this pure coordinate math -- see that method's docstring), so
-        they always show the real scene-local numbers immediately rather
-        than a map-CRS placeholder that only gets corrected later.
+        spinboxes below display that same map-CRS point directly, with no
+        scene-local conversion at all -- see _focus_map's docstring.
         """
         canvas = self.iface.mapCanvas()
         canvas.setMapTool(self.pan_tool)  # one-shot pick, then always back to Pan
@@ -1698,66 +1659,58 @@ class CameraPathDockWidget(QDockWidget):
                 _log(f"pick_on_map: no point cloud or DEM hit, ground map_point={map_point}")
         self._focus_map = map_point
 
-        try:
-            display_point = self._live_or_headless_canvas3d().mapSettings().mapToWorldCoordinates(map_point)
-        except Exception:
-            display_point = map_point
-
+        # focus_x/y/z always display/accept map/project CRS now (see
+        # _focus_map's docstring in __init__) -- map_point is already exactly
+        # that, no conversion needed.
         for box in (self.focus_x, self.focus_y, self.focus_z):
             box.blockSignals(True)
-        self.focus_x.setValue(display_point.x())
-        self.focus_y.setValue(display_point.y())
-        self.focus_z.setValue(display_point.z())
+        self.focus_x.setValue(map_point.x())
+        self.focus_y.setValue(map_point.y())
+        self.focus_z.setValue(map_point.z())
         for box in (self.focus_x, self.focus_y, self.focus_z):
             box.blockSignals(False)
         self._update_path_visualization()
 
     def _on_focus_spinbox_changed(self):
         """Wired to focus_x/y/z's valueChanged -- fires only for a genuine manual
-        edit (programmatic updates elsewhere block signals first). Captures the
-        map-CRS equivalent of whatever was just typed, using whatever origin is
-        current *right now* -- must happen before _update_path_visualization()
-        below, since that can end up growing the 3D scene's extent (path_
-        visualization.py), which recenters origin and would make this same
-        scene-local number mean something different from here on.
+        edit (programmatic updates elsewhere block signals first). focus_x/y/z
+        always hold map/project CRS values now (see _focus_map's docstring in
+        __init__), so this just copies them into _focus_map directly -- no
+        scene-local conversion, no 3D canvas/origin involved at all, and
+        nothing that can go stale relative to what's displayed.
 
-        Uses _live_or_headless_canvas3d(), not _get_canvas3d() -- same reason
-        _update_path_visualization() avoids _get_canvas3d(): that call creates
-        a real 3D view as a side effect if none exists, which would mean
-        typing into a focus field opens a 3D view the user never asked for.
-        The headless stand-in gives correct map<->scene math with no visible
-        canvas needed (see that method's docstring).
-
-        Previously this skipped updating _focus_map entirely whenever no live
-        3D canvas existed yet, leaving it stale at whatever it was last set to
-        (e.g. by Center on elevation data) even though the spinbox itself now
-        showed the freshly typed value -- the two could disagree, and
-        anything reading _focus_map afterwards (including a later Preview
-        Trajectory/Export, which derives the actual camera target from
-        _focus_map, not the spinboxes) would silently use the old value
-        instead of what was just typed. Always recomputing it here, with the
-        headless fallback, keeps the two in sync unconditionally.
+        (This used to convert scene-local spinbox values to map-CRS via
+        worldToMapCoordinates(), which only ran when a live 3D canvas already
+        existed -- if the user typed a value before one existed yet,
+        _focus_map silently kept its old value instead, and a later Preview
+        Trajectory/Export would use that stale target instead of what was
+        just typed. Spinboxes holding map-CRS values directly removes the
+        conversion, and the bug, entirely.)
         """
-        scene_focus = QgsVector3D(self.focus_x.value(), self.focus_y.value(), self.focus_z.value())
-        try:
-            self._focus_map = self._live_or_headless_canvas3d().mapSettings().worldToMapCoordinates(scene_focus)
-        except Exception:
-            self._focus_map = None
+        self._focus_map = QgsVector3D(self.focus_x.value(), self.focus_y.value(), self.focus_z.value())
         self._update_path_visualization()
 
     def _current_focus(self, canvas3d):
-        """Scene-local focus point for _build_animator() -- re-derived fresh from
-        _focus_map (map-CRS, origin-independent) using whatever origin canvas3d
-        currently has, rather than trusting focus_x/y/z directly. Those spinboxes
-        hold whatever scene-local numbers were valid *when last set*; if the 3D
-        scene's origin has moved since (see _focus_map's docstring in __init__),
-        reinterpreting those same numbers against the new origin would silently
-        target the wrong real-world location -- reported as the camera path/look
-        direction ending up nowhere near the point cloud after tweaking params.
-        Falls back to reading the spinboxes directly if there's no map-CRS focus
-        to derive from yet (e.g. CRS-less point clouds, or focus never set, or
-        this is the very first canvas ever created for this session -- nothing
-        could have gone stale yet in that case)."""
+        """Scene-local focus point for _build_animator() -- converted fresh from
+        _focus_map (map-CRS, origin-independent -- see its docstring in
+        __init__) using whatever origin canvas3d currently has right now.
+        Needed because QGIS's 3D camera API (setLookingAtPoint()) only
+        understands scene-local coordinates, even though focus_x/y/z
+        themselves display/accept map-CRS values -- see _on_focus_spinbox_
+        changed(). Re-deriving from _focus_map rather than caching a
+        scene-local value once means this is always correct even if the 3D
+        scene's origin has since moved (e.g. path_visualization.py's own
+        extent-growing fix recenters it) -- a cached scene-local number would
+        silently target the wrong real-world location after that, reported as
+        the camera path/look direction ending up nowhere near the point cloud
+        after tweaking params.
+
+        Falls back to reading focus_x/y/z directly (as already scene-local,
+        unconverted) if there's no map-CRS focus to derive from -- only
+        happens for CRS-less point cloud layers (see _center_on_point_clouds(),
+        which leaves _focus_map as None in exactly that case, since there's no
+        map CRS such a layer's coordinates could mean anything in) or if no
+        focus has been set at all yet."""
         if self._focus_map is not None and not _canvas_is_dead(canvas3d):
             try:
                 return canvas3d.mapSettings().mapToWorldCoordinates(self._focus_map)
