@@ -1383,8 +1383,8 @@ class CameraPathDockWidget(QDockWidget):
                 if not configured:
                     try:
                         map_settings.setTerrainRenderingEnabled(False)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log(f"could not disable default terrain rendering: {exc}")
                     _log(
                         "This QGIS version doesn't expose a Python-accessible way "
                         "this plugin could find to configure DEM terrain shape "
