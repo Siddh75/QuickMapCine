@@ -315,14 +315,6 @@ class CameraPathDockWidget(QDockWidget):
         # keeps every animator pointed at the real spot regardless of how many
         # times origin has shifted in between. See _build_animator().
         self._focus_map = None
-        # True once the user has deliberately set a focus point themselves --
-        # Pick on map, typing into focus_x/y/z directly, or clicking "Center
-        # on point clouds" (the button, not _preview_trajectory()'s own
-        # automatic fallback call to the same method -- see that method's
-        # docstring). While this stays False, _preview_trajectory() centers
-        # on the point clouds automatically each time, since there's no
-        # user-chosen focus to respect yet.
-        self._focus_user_set = False
         # Set by _load_json_file()/_load_csv_with_current_mapping(); read by
         # _build_animator() when the source combo is on "Import trajectory file".
         self._imported_keyframes = None
@@ -603,7 +595,7 @@ class CameraPathDockWidget(QDockWidget):
             "Doesn't touch the curve parameters above (see Calculate "
             "Automatically for those).",
         )
-        center_btn.clicked.connect(self._on_center_on_point_clouds_clicked)
+        center_btn.clicked.connect(self._center_on_point_clouds)
         focus_row.addWidget(center_btn)
         pick_btn = _icon_button(
             _pin_icon(),
@@ -1504,15 +1496,6 @@ class CameraPathDockWidget(QDockWidget):
         has_valid_crs = any(layer.crs().isValid() for layer in layers)
         return extent, z_lo, z_hi, has_valid_crs, layers
 
-    def _on_center_on_point_clouds_clicked(self):
-        """Button click handler -- separate from _center_on_point_clouds()
-        itself so that _preview_trajectory()'s own automatic fallback call to
-        that same method (see its docstring) doesn't count as the user
-        having deliberately chosen a focus point. Only a genuine click here
-        (or Pick on map, or typing into focus_x/y/z) sets _focus_user_set."""
-        self._focus_user_set = True
-        self._center_on_point_clouds()
-
     def _center_on_point_clouds(self):
         """Moves the focus point to the visible elevation layers' (point
         clouds and/or DEM-enabled rasters -- see _is_elevation_layer())
@@ -1548,9 +1531,7 @@ class CameraPathDockWidget(QDockWidget):
             # effect on _focus_map (the authoritative value, set below straight
             # from map_center with no origin baked in at all) or anything
             # _build_animator() re-derives from it later; it only affects these
-            # spinboxes' displayed numbers, which _refresh_focus_spinboxes_from_map()
-            # redisplays correctly relative to whatever canvas is live once one
-            # actually exists anyway.
+            # spinboxes' displayed numbers.
             map_settings = self._live_or_headless_canvas3d().mapSettings()
             _log(f"scene origin={map_settings.origin()} project_crs={project.crs().authid() or 'invalid/none'}")
             scene_center = map_settings.mapToWorldCoordinates(map_center)
@@ -1631,27 +1612,6 @@ class CameraPathDockWidget(QDockWidget):
         open the 3D view and actually see a result."""
         self._update_path_visualization()
 
-    def _refresh_focus_spinboxes_from_map(self):
-        """Redisplays focus_x/y/z in real scene-local coordinates, now that a
-        3D canvas actually exists -- covers the case where the focus was set
-        (e.g. via Pick on map) before any 3D view existed, when the spinboxes
-        could only show the raw map-CRS numbers as a placeholder (see
-        _on_map_point_picked). No-op if there's nothing to re-derive from, or
-        no live canvas to convert with."""
-        if self._focus_map is None or self.canvas3d is None or sip.isdeleted(self.canvas3d):
-            return
-        try:
-            scene_point = self.canvas3d.mapSettings().mapToWorldCoordinates(self._focus_map)
-        except Exception:
-            return
-        for box in (self.focus_x, self.focus_y, self.focus_z):
-            box.blockSignals(True)
-        self.focus_x.setValue(scene_point.x())
-        self.focus_y.setValue(scene_point.y())
-        self.focus_z.setValue(scene_point.z())
-        for box in (self.focus_x, self.focus_y, self.focus_z):
-            box.blockSignals(False)
-
     def _preview_trajectory(self):
         """Opens the 3D view (creating one if it doesn't exist yet, or
         bringing an existing-but-buried one back to front) and shows the
@@ -1663,16 +1623,17 @@ class CameraPathDockWidget(QDockWidget):
         animate the camera through the path at all -- it's just a look,
         not a run.
 
-        Centers on the visible elevation layers first, by default, as long as
-        the user hasn't deliberately set a focus point themselves (Pick on
-        map, typing into focus_x/y/z, or clicking Center on elevation data --
-        see _focus_user_set's docstring in __init__). This calls
-        _center_on_point_clouds() directly, not the button's click handler,
-        so it doesn't itself count as the user having chosen a focus --
-        every future click keeps auto-centering on whatever the point clouds
-        currently are until the user actually picks something. Only
-        meaningful in "Generate new" mode -- an imported trajectory's own
-        keyframe positions don't use the focus point at all.
+        Never writes to focus_x/y/z or _focus_map -- it only reads whatever
+        focus is already current (via _current_focus(), same as an actual
+        Preview/Export run would) and points the camera there. If no focus
+        has been set yet, that's whatever focus_x/y/z default to (0,0,0) or
+        whatever was last typed/picked; use Center on elevation data first to
+        aim it at the loaded data. This used to auto-center on the visible
+        elevation layers itself the first time, which silently overwrote a
+        focus the user had just typed in if no 3D canvas existed yet when
+        they typed it (the display and the internal map-CRS value could go
+        out of sync in that case) -- removed rather than patched further, so
+        this action can never surprise-edit a value the user set by hand.
 
         Also points the 3D view's ACTUAL camera at the trajectory's first
         frame (not just the focus_x/y/z display) -- a freshly created 3D
@@ -1683,13 +1644,9 @@ class CameraPathDockWidget(QDockWidget):
         drives during playback, so "centered" here means exactly where frame
         0 of an actual Preview/Export run would start.
         """
-        if not self._focus_user_set and not self._is_import_mode():
-            self._center_on_point_clouds()
-
         canvas3d = self._get_canvas3d()
         canvas3d.show()
         canvas3d.requestActivate()
-        self._refresh_focus_spinboxes_from_map()
         self._update_path_visualization()
 
         animator = self._build_animator()
@@ -1709,20 +1666,19 @@ class CameraPathDockWidget(QDockWidget):
 
     def _on_map_point_picked(self, point, _button):
         """Sets the focus point from a 2D-map click -- deliberately never
-        touches self.canvas3d/_get_canvas3d(). Picking a point cloud's (x,y,z)
-        is a pure 2D-canvas operation (_pick_point_from_cloud queries the 2D
-        map's own layers), so the only reason this used to call
-        _get_canvas3d() was to convert the picked map-CRS point into
-        scene-local numbers for display -- and that conversion needs a 3D
-        canvas to exist, which would pop one open as a side effect of what's
-        otherwise a purely 2D action. _focus_map (map-CRS, origin-
-        independent -- see its docstring in __init__) is set directly from
-        the pick instead, which is all _build_animator() actually needs; the
-        spinboxes below just show the best display available right now.
+        calls _get_canvas3d(), so this can't pop open a 3D view as a side
+        effect of what's otherwise a purely 2D action. _focus_map (map-CRS,
+        origin-independent -- see its docstring in __init__) is set directly
+        from the pick, which is all _build_animator() actually needs; the
+        spinboxes below are converted for display via
+        _live_or_headless_canvas3d() (reuses a real 3D canvas if one's
+        already open, otherwise a headless stand-in that's exactly as correct
+        for this pure coordinate math -- see that method's docstring), so
+        they always show the real scene-local numbers immediately rather
+        than a map-CRS placeholder that only gets corrected later.
         """
         canvas = self.iface.mapCanvas()
         canvas.setMapTool(self.pan_tool)  # one-shot pick, then always back to Pan
-        self._focus_user_set = True
 
         hit = self._pick_point_from_cloud(point)
         if hit is not None:
@@ -1742,19 +1698,9 @@ class CameraPathDockWidget(QDockWidget):
                 _log(f"pick_on_map: no point cloud or DEM hit, ground map_point={map_point}")
         self._focus_map = map_point
 
-        # If a 3D canvas already happens to exist, show the real scene-local
-        # equivalent; otherwise there's nothing to convert with yet (see
-        # _refresh_focus_spinboxes_from_map, which will fill in the real
-        # numbers once one does exist -- e.g. when Preview Trajectory is next
-        # clicked) -- show the picked map-CRS point directly as a placeholder,
-        # same fallback convention _center_on_point_clouds() uses when there's
-        # no valid CRS to convert with.
-        if self.canvas3d is not None and not sip.isdeleted(self.canvas3d):
-            try:
-                display_point = self.canvas3d.mapSettings().mapToWorldCoordinates(map_point)
-            except Exception:
-                display_point = map_point
-        else:
+        try:
+            display_point = self._live_or_headless_canvas3d().mapSettings().mapToWorldCoordinates(map_point)
+        except Exception:
             display_point = map_point
 
         for box in (self.focus_x, self.focus_y, self.focus_z):
@@ -1775,20 +1721,28 @@ class CameraPathDockWidget(QDockWidget):
         visualization.py), which recenters origin and would make this same
         scene-local number mean something different from here on.
 
-        Deliberately reads self.canvas3d directly, not _get_canvas3d() -- same
-        reason _update_path_visualization() does: that call creates a 3D view as
-        a side effect if none exists, which would mean typing into a focus field
-        opens a 3D view the user never asked for. No canvas yet just means
-        there's no origin to have moved -- _current_focus() below falls back to
-        the spinboxes directly in that case, which is correct as-is.
+        Uses _live_or_headless_canvas3d(), not _get_canvas3d() -- same reason
+        _update_path_visualization() avoids _get_canvas3d(): that call creates
+        a real 3D view as a side effect if none exists, which would mean
+        typing into a focus field opens a 3D view the user never asked for.
+        The headless stand-in gives correct map<->scene math with no visible
+        canvas needed (see that method's docstring).
+
+        Previously this skipped updating _focus_map entirely whenever no live
+        3D canvas existed yet, leaving it stale at whatever it was last set to
+        (e.g. by Center on elevation data) even though the spinbox itself now
+        showed the freshly typed value -- the two could disagree, and
+        anything reading _focus_map afterwards (including a later Preview
+        Trajectory/Export, which derives the actual camera target from
+        _focus_map, not the spinboxes) would silently use the old value
+        instead of what was just typed. Always recomputing it here, with the
+        headless fallback, keeps the two in sync unconditionally.
         """
-        self._focus_user_set = True
-        if self.canvas3d is not None and not sip.isdeleted(self.canvas3d):
-            scene_focus = QgsVector3D(self.focus_x.value(), self.focus_y.value(), self.focus_z.value())
-            try:
-                self._focus_map = self.canvas3d.mapSettings().worldToMapCoordinates(scene_focus)
-            except Exception:
-                self._focus_map = None
+        scene_focus = QgsVector3D(self.focus_x.value(), self.focus_y.value(), self.focus_z.value())
+        try:
+            self._focus_map = self._live_or_headless_canvas3d().mapSettings().worldToMapCoordinates(scene_focus)
+        except Exception:
+            self._focus_map = None
         self._update_path_visualization()
 
     def _current_focus(self, canvas3d):
