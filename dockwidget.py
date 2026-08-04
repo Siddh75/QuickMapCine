@@ -18,6 +18,7 @@ from qgis.core import (
     QgsPointCloudLayer,
     QgsPointXY,
     QgsProject,
+    QgsRasterLayer,
     QgsRectangle,
     QgsSettings,
     QgsVector3D,
@@ -54,6 +55,37 @@ from .path_visualization import PathVisualizer
 
 def _log(msg):
     QgsMessageLog.logMessage(msg, "QuickMapCine", Qgis.Info)
+
+
+def _is_elevation_layer(layer):
+    """True for any layer this plugin can treat as an elevation source when
+    auto-fitting the focus point/curve parameters or sampling a Pick-on-map
+    click -- point clouds (always, same as before v0.2) or a raster DEM
+    layer with Elevation explicitly enabled (Layer Properties > Elevation >
+    Enable, "Represents elevation surface" -- the same flag QGIS's own 3D
+    Terrain configuration uses to pick a DEM). Deliberately NOT any single-
+    or few-band raster, since that would just as happily match an ordinary
+    basemap or imagery layer -- isEnabled() is the one unambiguous signal
+    that the user has actually designated this raster as elevation data.
+    """
+    if isinstance(layer, QgsPointCloudLayer):
+        return True
+    if isinstance(layer, QgsRasterLayer):
+        props = layer.elevationProperties()
+        return props is not None and props.isEnabled()
+    return False
+
+
+def _dem_band_number(raster_elevation_properties):
+    """Which band represents elevation for a DEM-enabled raster layer.
+    bandNumber() was only added in QGIS 3.38 (this plugin's floor is 3.36) --
+    band 1 is the correct fallback for the overwhelmingly common case (a
+    single-band DEM), so a missing bandNumber() just means an older QGIS,
+    not an error."""
+    try:
+        return raster_elevation_properties.bandNumber()
+    except AttributeError:
+        return 1
 
 
 class _HeadlessMapSettings3D:
@@ -531,10 +563,12 @@ class CameraPathDockWidget(QDockWidget):
         generate_form.addRow(curve_split)
 
         # Fills every curve param below (radius/height, whichever this curve
-        # has) from the visible point clouds' own extent -- the auto-fill half
-        # of what "Center on point clouds" used to do in one combined action;
-        # see _calculate_automatically()/_point_cloud_extent(). Split out so
-        # Center on point clouds can be a pure "move the focus point" action.
+        # has) from the visible elevation layers' own extent (point clouds
+        # and/or DEM-enabled rasters -- see _is_elevation_layer()) -- the
+        # auto-fill half of what "Center on elevation data" used to do in one
+        # combined action; see _calculate_automatically()/_point_cloud_extent().
+        # Split out so Center on elevation data can be a pure "move the focus
+        # point" action.
         # Added to param_form itself (field column only, empty label) rather
         # than generate_form below -- lines it up in the same column as the
         # curve parameter spinboxes above it instead of spanning the full
@@ -544,9 +578,10 @@ class CameraPathDockWidget(QDockWidget):
         self.calc_btn = QPushButton("Calculate Automatically")
         self.calc_btn.setToolTip(
             "Sets this curve's radius/height parameters from the combined "
-            "extent of the visible point cloud layers -- same source data "
-            "\"Center on point clouds\" uses for the focus point, but this "
-            "only touches the curve parameters above, not the focus point."
+            "extent of the visible point cloud and DEM elevation layers -- "
+            "same source data \"Center on elevation data\" uses for the focus "
+            "point, but this only touches the curve parameters above, not "
+            "the focus point."
         )
         self.calc_btn.clicked.connect(self._calculate_automatically)
 
@@ -562,13 +597,20 @@ class CameraPathDockWidget(QDockWidget):
         # labels here used to force the whole dock wider).
         center_btn = _icon_button(
             _crosshair_icon(),
-            "Center on point clouds -- moves the focus point to the combined "
-            "center of the visible point cloud layers. Doesn't touch the "
-            "curve parameters above (see Calculate Automatically for those).",
+            "Center on elevation data -- moves the focus point to the combined "
+            "center of the visible point cloud and DEM elevation layers "
+            "(a raster layer with Elevation enabled in Layer Properties). "
+            "Doesn't touch the curve parameters above (see Calculate "
+            "Automatically for those).",
         )
         center_btn.clicked.connect(self._on_center_on_point_clouds_clicked)
         focus_row.addWidget(center_btn)
-        pick_btn = _icon_button(_pin_icon(), "Pick on map -- click a point on the 2D map to set the focus point.")
+        pick_btn = _icon_button(
+            _pin_icon(),
+            "Pick on map -- click a point on the 2D map to set the focus point. "
+            "Uses the real point cloud/DEM elevation at the click if one is "
+            "found there, otherwise ground level (z=0).",
+        )
         pick_btn.clicked.connect(self._start_pick_on_map)
         focus_row.addWidget(pick_btn)
         generate_form.addRow("Focus point (x, y, z)", focus_row)
@@ -1312,21 +1354,51 @@ class CameraPathDockWidget(QDockWidget):
         _log(f"pick_point_from_cloud: {'found ' + str(best) if best else 'no point cloud data near click'}")
         return best
 
+    def _sample_dem_elevation(self, map_point_xy):
+        """Samples elevation at map_point_xy from the first visible DEM-
+        enabled raster layer (see _is_elevation_layer()) with valid data
+        there. Returns a float, or None if there's no such layer or the
+        point falls outside its extent/nodata. Used by _on_map_point_picked()
+        as the fallback below point clouds -- point cloud data, where
+        present, is the more direct/authoritative source (an actual sampled
+        surface point, not an interpolated raster cell), so it's tried
+        first; this only runs when that comes up empty.
+        """
+        project = QgsProject.instance()
+        layers = [
+            l for l in self.iface.mapCanvas().layers()
+            if isinstance(l, QgsRasterLayer) and _is_elevation_layer(l)
+        ]
+        for layer in layers:
+            point = map_point_xy
+            if layer.crs().isValid() and layer.crs() != project.crs():
+                transform = QgsCoordinateTransform(project.crs(), layer.crs(), project)
+                point = transform.transform(point)
+            band = _dem_band_number(layer.elevationProperties())
+            value, ok = layer.dataProvider().sample(point, band)
+            if ok and math.isfinite(value):
+                _log(f"sample_dem_elevation: hit '{layer.name()}' band {band} -> z={value}")
+                return value
+        return None
+
     def _point_cloud_extent(self):
-        """Combined map-CRS extent and z-range across every visible point
-        cloud layer, or None if there are none. Shared by _center_on_point_
-        clouds() (focus point) and _calculate_automatically() (curve radius/
-        height) -- both used to be one combined action; now split per-button,
-        but they still need the same underlying point-cloud geometry, just
-        turned into different numbers. Returns (extent, z_lo, z_hi,
-        has_valid_crs, layers); z_lo/z_hi are None if no layer had a finite
-        z-range.
+        """Combined map-CRS extent and z-range across every visible
+        elevation-source layer (point clouds, always; DEM-enabled raster
+        layers -- see _is_elevation_layer()), or None if there are none.
+        Shared by _center_on_point_clouds() (focus point) and
+        _calculate_automatically() (curve radius/height) -- both used to be
+        one combined action; now split per-button, but they still need the
+        same underlying geometry, just turned into different numbers.
+        Returns (extent, z_lo, z_hi, has_valid_crs, layers); z_lo/z_hi are
+        None if no layer had a finite z-range. Name kept from before DEM
+        support was added (point clouds were the only source then); not
+        renamed to avoid a purely-cosmetic diff across every call site.
         """
         project = QgsProject.instance()
         # mapCanvas().layers() is the same checked/visible layer list the 3D scene
         # itself renders from -- using project.mapLayers() instead would fold in
         # unchecked layers that aren't actually part of what's on screen.
-        layers = [l for l in self.iface.mapCanvas().layers() if isinstance(l, QgsPointCloudLayer)]
+        layers = [l for l in self.iface.mapCanvas().layers() if _is_elevation_layer(l)]
         if not layers:
             return None
 
@@ -1367,16 +1439,18 @@ class CameraPathDockWidget(QDockWidget):
         self._center_on_point_clouds()
 
     def _center_on_point_clouds(self):
-        """Moves the focus point to the visible point clouds' combined
-        center. Only touches focus_x/y/z/_focus_map -- see
+        """Moves the focus point to the visible elevation layers' (point
+        clouds and/or DEM-enabled rasters -- see _is_elevation_layer())
+        combined center. Only touches focus_x/y/z/_focus_map -- see
         _calculate_automatically() for the curve-parameter half of what this
-        button used to also do in one combined action."""
+        button used to also do in one combined action. Name kept from before
+        DEM support was added -- see _point_cloud_extent()'s docstring."""
         info = self._point_cloud_extent()
         if info is None:
-            _log("center_on_point_clouds: no point cloud layers")
+            _log("center_on_point_clouds: no elevation-source layers")
             return
         extent, z_lo, z_hi, has_valid_crs, layers = info
-        _log(f"center_on_point_clouds: {len(layers)} point cloud layer(s): {[l.name() for l in layers]}")
+        _log(f"center_on_point_clouds: {len(layers)} elevation-source layer(s): {[l.name() for l in layers]}")
 
         center_z = (z_lo + z_hi) / 2 if z_lo is not None else 0.0
         map_center = QgsVector3D(extent.center().x(), extent.center().y(), center_z)
@@ -1435,20 +1509,22 @@ class CameraPathDockWidget(QDockWidget):
 
     def _calculate_automatically(self):
         """Fills every curve parameter with a "radius" or "height" role
-        (see CURVES) from the visible point clouds' combined extent -- the
-        auto-fill half of what "Center on point clouds" used to also do in
-        one combined action. Only touches the curve's own param_boxes, not
-        the focus point (see _center_on_point_clouds() for that)."""
+        (see CURVES) from the visible elevation layers' combined extent
+        (point clouds and/or DEM-enabled rasters -- see
+        _is_elevation_layer()) -- the auto-fill half of what "Center on
+        elevation data" used to also do in one combined action. Only touches
+        the curve's own param_boxes, not the focus point (see
+        _center_on_point_clouds() for that)."""
         info = self._point_cloud_extent()
         if info is None:
-            _log("calculate_automatically: no point cloud layers")
+            _log("calculate_automatically: no elevation-source layers")
             return
         extent, z_lo, z_hi, _has_valid_crs, layers = info
-        _log(f"calculate_automatically: {len(layers)} point cloud layer(s): {[l.name() for l in layers]}")
+        _log(f"calculate_automatically: {len(layers)} elevation-source layer(s): {[l.name() for l in layers]}")
 
         # Half the extent's diagonal guarantees the curve orbits outside the data
         # regardless of aspect ratio; the z span gives a vertical excursion that
-        # actually matches this point cloud instead of the curve's fixed default.
+        # actually matches this data instead of the curve's fixed default.
         radius = math.hypot(extent.width(), extent.height()) / 2
         height = (z_hi - z_lo) if z_lo is not None else 0.0
         _log(f"fitting curve params to extent: radius={radius:.2f} height={height:.2f}")
@@ -1512,9 +1588,9 @@ class CameraPathDockWidget(QDockWidget):
         animate the camera through the path at all -- it's just a look,
         not a run.
 
-        Centers on the visible point clouds first, by default, as long as
+        Centers on the visible elevation layers first, by default, as long as
         the user hasn't deliberately set a focus point themselves (Pick on
-        map, typing into focus_x/y/z, or clicking Center on point clouds --
+        map, typing into focus_x/y/z, or clicking Center on elevation data --
         see _focus_user_set's docstring in __init__). This calls
         _center_on_point_clouds() directly, not the button's click handler,
         so it doesn't itself count as the user having chosen a focus --
@@ -1579,9 +1655,16 @@ class CameraPathDockWidget(QDockWidget):
             map_point = QgsVector3D(hit[0], hit[1], hit[2])
             _log(f"pick_on_map: hit point cloud at map_point={map_point}")
         else:
-            # No point cloud data under the click -- fall back to ground level (z=0).
-            map_point = QgsVector3D(point.x(), point.y(), 0.0)
-            _log(f"pick_on_map: no point cloud hit, ground map_point={map_point}")
+            # No point cloud data under the click -- try a DEM-enabled raster
+            # layer next (see _sample_dem_elevation()), and only fall back to
+            # ground level (z=0) if neither source has anything here.
+            dem_z = self._sample_dem_elevation(point)
+            if dem_z is not None:
+                map_point = QgsVector3D(point.x(), point.y(), dem_z)
+                _log(f"pick_on_map: no point cloud hit, sampled DEM z={dem_z} at map_point={map_point}")
+            else:
+                map_point = QgsVector3D(point.x(), point.y(), 0.0)
+                _log(f"pick_on_map: no point cloud or DEM hit, ground map_point={map_point}")
         self._focus_map = map_point
 
         # If a 3D canvas already happens to exist, show the real scene-local
