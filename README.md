@@ -11,6 +11,7 @@ A QGIS plugin that drives the 3D Map View camera along parametric paths and expo
 - **Export**: render every frame and stitch them into a video via `ffmpeg`.
 - **Save trajectory**: export the generated (or imported) keyframes back out to `trajectory.json`/CSV for reuse or editing in another tool.
 - **Rotation controls**: apply an extra x/y/z rotation on top of the generated path.
+- **Translate controls**: shift the camera's position by a fixed x/y/z offset without moving the look-at point — applied after rotation.
 - **Works without an open 3D view**: preview, path visualization, and centering on elevation data all fall back to a headless coordinate-conversion path when no 3D view is open, instead of forcing one open.
 
 ## Requirements

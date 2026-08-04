@@ -653,6 +653,34 @@ class CameraPathDockWidget(QDockWidget):
         )
         generate_form.addRow(rotation_label, rotation_row)
 
+        # Same "lives inside Generate new, still functionally applies to
+        # imported trajectories too" trade-off as Rotation above -- see
+        # CameraPathAnimator's translate_x/translate_y/translate_z docstring
+        # and _build_animator(). Deliberately placed right after Rotation
+        # (applied after it too, in CameraPathAnimator._frame_data() -- see
+        # that docstring for why) rather than up near Focus point, since it's
+        # really a variation on "reshape the generated/imported path", not a
+        # focus-point action.
+        self.translate_x = QDoubleSpinBox()
+        self.translate_y = QDoubleSpinBox()
+        self.translate_z = QDoubleSpinBox()
+        translate_row = QHBoxLayout()
+        for axis_text, box in (("X:", self.translate_x), ("Y:", self.translate_y), ("Z:", self.translate_z)):
+            box.setRange(-1e9, 1e9)
+            box.setDecimals(2)
+            box.setValue(0.0)
+            box.valueChanged.connect(lambda _: self._update_path_visualization())
+            translate_row.addWidget(QLabel(axis_text))
+            translate_row.addWidget(box)
+        translate_label = QLabel("Translate X, Y, Z")
+        translate_label.setToolTip(
+            "Shifts every frame's camera position by this fixed offset -- the "
+            "look-at point stays exactly where it already was (unlike Rotation "
+            "above, which moves position and look-at together). Applied after "
+            "Rotation. Units match the project CRS (typically meters)."
+        )
+        generate_form.addRow(translate_label, translate_row)
+
         # Explicit trigger for the path/look-vector preview -- unlike the
         # passive per-field updates above (every curve-param/focus spinbox
         # already calls _update_path_visualization() on change), a deliberate
@@ -1743,7 +1771,8 @@ class CameraPathDockWidget(QDockWidget):
         _update_path_visualization() passes one explicitly instead -- the
         real self.canvas3d if a 3D view is already open, otherwise a headless,
         invisible _HeadlessCanvas3D stand-in -- so the 2D-only preview never
-        forces a 3D view open just from a passive curve-param/rotation edit.
+        forces a 3D view open just from a passive curve-param/rotation/
+        translate edit.
         """
         if self._is_import_mode():
             if not self._imported_keyframes:
@@ -1760,6 +1789,9 @@ class CameraPathDockWidget(QDockWidget):
                 rotation_x_deg=self.rotation_x.value(),
                 rotation_y_deg=self.rotation_y.value(),
                 rotation_z_deg=self.rotation_z.value(),
+                translate_x=self.translate_x.value(),
+                translate_y=self.translate_y.value(),
+                translate_z=self.translate_z.value(),
                 on_finished=on_finished,
                 on_frame=on_frame,
             )
@@ -1782,6 +1814,9 @@ class CameraPathDockWidget(QDockWidget):
             rotation_x_deg=self.rotation_x.value(),
             rotation_y_deg=self.rotation_y.value(),
             rotation_z_deg=self.rotation_z.value(),
+            translate_x=self.translate_x.value(),
+            translate_y=self.translate_y.value(),
+            translate_z=self.translate_z.value(),
             on_finished=on_finished,
             on_frame=on_frame,
         )

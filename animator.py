@@ -131,6 +131,7 @@ class CameraPathAnimator:
         self, canvas3d, curve_name, curve_kwargs, focus, duration_s, fps, output_dir=None,
         make_video=True, look_mode="focus", imported_keyframes=None, on_finished=None,
         rotation_x_deg=0.0, rotation_y_deg=0.0, rotation_z_deg=0.0, on_frame=None,
+        translate_x=0.0, translate_y=0.0, translate_z=0.0,
     ):
         """Either generates the path from a curve (curve_name/curve_kwargs/focus,
         the original mode), or plays back imported_keyframes verbatim -- a list of
@@ -166,6 +167,25 @@ class CameraPathAnimator:
         from the rotated offset afterward since, unlike a Z-only rotation,
         X/Y rotations do change which direction is "up" relative to the offset.
 
+        translate_x/translate_y/translate_z: shifts every frame's camera
+        position by this fixed offset (generated or imported, same as
+        rotation) -- the look-at point (center) is deliberately left
+        completely untouched, unlike rotation, which moves position and
+        center together. Applied in _frame_data() as the very last step,
+        after rotation -- so if both are set, rotation happens first (as
+        it already does with translate_* at 0), and translate then nudges
+        the already-rotated position along these fixed X/Y/Z axes; it does
+        NOT get swept along by the rotation itself. distance/pitch/yaw are
+        recomputed from the new position against the unmoved center
+        afterward, same as rotation does, since moving the camera without
+        moving what it's looking at changes all three. Units match
+        whatever the project's CRS/3D scene use (typically meters) -- a
+        translation is a plain delta, not an absolute point, so unlike an
+        absolute position it means the same physical displacement whether
+        applied to a map-CRS or scene-local number (see dockwidget.py's
+        _focus_map docstring for why absolute points need to be handled
+        more carefully than this).
+
         on_finished: called once, whether playback runs to completion or is cut
         short by stop() -- e.g. by dockwidget.py's path/focus visualization,
         which needs to know exactly when an export run ends so it can restore
@@ -183,6 +203,7 @@ class CameraPathAnimator:
         self._rotation_rad = (
             math.radians(rotation_x_deg), math.radians(rotation_y_deg), math.radians(rotation_z_deg),
         )
+        self._translate = (translate_x, translate_y, translate_z)
         if imported_keyframes is not None:
             self.curve_name = None
             self.curve_fn = None
@@ -429,6 +450,21 @@ class CameraPathAnimator:
                 position.x() - center.x(), position.y() - center.y(), position.z() - center.z()
             )
 
+        if any(self._translate):
+            # Last step, after rotation -- see translate_x's docstring in
+            # __init__ for why this order (translate is never itself swept
+            # along by the rotation above). Only position moves; center is
+            # deliberately left exactly as rotation (or the raw curve/import)
+            # produced it -- that's the whole point of this feature (translate
+            # the camera without moving what it's looking at). distance/pitch/
+            # yaw are recomputed from the new position against the still-
+            # unmoved center, same as the rotation branch above does.
+            tx, ty, tz = self._translate
+            position = QgsVector3D(position.x() + tx, position.y() + ty, position.z() + tz)
+            distance, pitch, yaw = _offset_to_pose(
+                position.x() - center.x(), position.y() - center.y(), position.z() - center.z()
+            )
+
         return position, center, distance, pitch, yaw
 
     def _time_for_frame(self, frame_idx):
@@ -508,6 +544,12 @@ class CameraPathAnimator:
                 "x": math.degrees(self._rotation_rad[0]),
                 "y": math.degrees(self._rotation_rad[1]),
                 "z": math.degrees(self._rotation_rad[2]),
+            },
+            # Same "already baked in, recorded for reference" reasoning as
+            # rotation_deg above -- applied after rotation (see translate_x's
+            # docstring in __init__), position only, center untouched.
+            "translate": {
+                "x": self._translate[0], "y": self._translate[1], "z": self._translate[2],
             },
             "focus_scene": (
                 {"x": live_focus.x(), "y": live_focus.y(), "z": live_focus.z()}
