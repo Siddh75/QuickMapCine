@@ -18,8 +18,6 @@ from qgis.core import (
     QgsPointCloudLayer,
     QgsPointXY,
     QgsProject,
-    QgsProjectElevationProperties,
-    QgsRasterDemTerrainProvider,
     QgsRasterLayer,
     QgsRectangle,
     QgsSettings,
@@ -1322,41 +1320,65 @@ class CameraPathDockWidget(QDockWidget):
             # v0.2 added DEM-enabled raster layers as an elevation source (see
             # _is_elevation_layer()) -- when one is visible, configure the 3D
             # view's terrain to actually use its real shape instead of leaving
-            # it flat, via the same provider/properties plumbing QGIS's own
-            # Project Properties > Elevation > Terrain dialog uses
-            # (QgsRasterDemTerrainProvider + Qgs3DMapSettings.configureTerrainFromProject()).
-            # QgsDemTerrainGenerator itself isn't exposed to Python at all, which
-            # is exactly the gap configureTerrainFromProject() bridges. A scratch
-            # QgsProjectElevationProperties is used purely as the parameter this
-            # method wants -- never assigned to QgsProject.instance() -- so this
-            # never mutates the user's actual project-level terrain settings,
-            # only this plugin's own private 3D view.
+            # it flat.
+            #
+            # QgsDemTerrainGenerator (the older, generator-based way of doing
+            # this) has never been exposed to Python, in any QGIS version --
+            # confirmed against QGIS's own API docs from 3.14 through master.
+            # QGIS 3.42 replaced the generator-based terrain API with a new
+            # settings-based one (Qgs3DMapSettings.setTerrainSettings() taking
+            # a QgsDemTerrainSettings), and *that* one is Python-accessible --
+            # confirmed directly against a QGIS 3.44 install via the console
+            # (hasattr(mapSettings(), "setTerrainSettings") is True there,
+            # while "setTerrainGenerator" and "configureTerrainFromProject"
+            # are both False/gone). QGIS documents QgsDemTerrainSettings as an
+            # unstable "tech preview" API that may change in a future
+            # release, so this is wrapped defensively and never assumed to be
+            # there.
+            #
+            # QGIS versions between this plugin's 3.36 floor and 3.42 predate
+            # both the old and new Python-accessible paths, as far as this
+            # plugin has found -- there terrain rendering is left off, same
+            # as before v0.2, with a log message pointing at the manual
+            # workaround (3D view's own Terrain dialog).
             dem_layers = [
                 l for l in self.iface.mapCanvas().layers()
                 if isinstance(l, QgsRasterLayer) and _is_elevation_layer(l)
             ]
             if dem_layers:
-                # Only one raster can drive a DEM terrain generator -- first
+                # Only one raster can drive DEM terrain at a time -- first
                 # visible match wins (same "first hit wins" precedence
                 # _sample_dem_elevation() already uses).
+                configured = False
                 try:
-                    info = self._point_cloud_extent()
-                    if info is None:
-                        raise RuntimeError("no combined extent available")
-                    full_extent = info[0]
-                    provider = QgsRasterDemTerrainProvider()
-                    provider.setLayer(dem_layers[0])
-                    scratch_properties = QgsProjectElevationProperties()
-                    scratch_properties.setTerrainProvider(provider)
-                    map_settings.configureTerrainFromProject(scratch_properties, full_extent)
+                    from qgis._3d import QgsDemTerrainSettings
+
+                    try:
+                        dem_settings = QgsDemTerrainSettings()
+                    except Exception:
+                        dem_settings = QgsDemTerrainSettings.create()
+                    dem_settings.setLayer(dem_layers[0])
+                    map_settings.setTerrainSettings(dem_settings)
                     map_settings.setTerrainRenderingEnabled(True)
-                    _log(f"configured 3D terrain from DEM layer '{dem_layers[0].name()}'")
+                    configured = True
+                    _log(f"configured 3D terrain from DEM layer '{dem_layers[0].name()}' via QgsDemTerrainSettings")
                 except Exception as exc:
-                    _log(f"could not configure DEM terrain, falling back to flat/off: {exc}")
+                    _log(f"QgsDemTerrainSettings terrain setup not available/failed: {exc}")
+
+                if not configured:
                     try:
                         map_settings.setTerrainRenderingEnabled(False)
                     except Exception:
                         pass
+                    _log(
+                        "This QGIS version doesn't expose a Python-accessible way "
+                        "this plugin could find to configure DEM terrain shape "
+                        "automatically (needs QGIS 3.42+). Terrain rendering left "
+                        "off -- open this 3D view's own 3D Configuration (wrench "
+                        "icon) > Terrain, set Type to 'DEM (Raster Layer)' and "
+                        f"pick '{dem_layers[0].name()}' manually if you want real "
+                        "terrain shape."
+                    )
             else:
                 try:
                     map_settings.setTerrainRenderingEnabled(False)
